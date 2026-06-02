@@ -16,6 +16,7 @@ from grocery_buddy.workflows.activities import (
     lookup_amazon_prices,
     lookup_kroger_prices,
     predict_low_items_activity,
+    run_evals_activity,
     send_approval_notification,
     send_purchase_confirmation_activity,
     update_cart_status,
@@ -45,6 +46,7 @@ async def run_worker() -> None:
             update_cart_status,
             execute_purchase_activity,
             send_purchase_confirmation_activity,
+            run_evals_activity,
         ],
     )
 

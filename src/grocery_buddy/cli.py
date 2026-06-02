@@ -126,3 +126,19 @@ def mcp() -> None:
     """Start the MCP server (for local Claude Code tool use)."""
     from grocery_buddy.mcp_server import main as mcp_main
     mcp_main()
+
+
+@main.command()
+@click.option("--user-id", required=True, help="User UUID to evaluate")
+def evals(user_id: str) -> None:
+    """Run prediction accuracy evals and emit scores to Langfuse."""
+    asyncio.run(_run_evals(user_id))
+
+
+async def _run_evals(user_id: str) -> None:
+    from grocery_buddy.evals import run_evals
+    results = await run_evals(user_id)
+    click.echo("\n── Eval results ──────────────────────────────")
+    for key, val in results.items():
+        click.echo(f"  {key}: {val}")
+    click.echo()

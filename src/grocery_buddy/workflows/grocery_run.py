@@ -120,6 +120,12 @@ class GroceryRunWorkflow:
                 schedule_to_close_timeout=_PURCHASE_TIMEOUT,
                 retry_policy=_NO_RETRY,  # idempotency is at app level
             )
+            await workflow.execute_activity(
+                "run_evals_activity",
+                {"user_id": user_id, "run_cost_usd": 0.0},
+                schedule_to_close_timeout=timedelta(minutes=2),
+                retry_policy=_STANDARD_RETRY,
+            )
             return GroceryRunResult(
                 status="purchased",
                 cart_id=cart_id,
@@ -176,6 +182,12 @@ class GroceryRunWorkflow:
                 schedule_to_close_timeout=_PURCHASE_TIMEOUT,
                 retry_policy=_NO_RETRY,
             )
+            await workflow.execute_activity(
+                "run_evals_activity",
+                {"user_id": user_id, "run_cost_usd": 0.0},
+                schedule_to_close_timeout=timedelta(minutes=2),
+                retry_policy=_STANDARD_RETRY,
+            )
             return GroceryRunResult(status="purchased", cart_id=cart_id)
 
         # Rejected or expired
@@ -183,6 +195,12 @@ class GroceryRunWorkflow:
             "update_cart_status",
             {"cart_id": cart_id, "status": final_status},
             schedule_to_close_timeout=timedelta(minutes=1),
+            retry_policy=_STANDARD_RETRY,
+        )
+        await workflow.execute_activity(
+            "run_evals_activity",
+            {"user_id": user_id, "run_cost_usd": 0.0},
+            schedule_to_close_timeout=timedelta(minutes=2),
             retry_policy=_STANDARD_RETRY,
         )
         return GroceryRunResult(status=final_status, cart_id=cart_id)

@@ -377,3 +377,17 @@ async def send_purchase_confirmation_activity(payload: dict) -> None:
         total_usd=payload["total_usd"],
         order_ref=payload.get("order_ref"),
     )
+
+
+# ── T16: Evals + cost alert ───────────────────────────────────────────────────
+
+
+@activity.defn
+async def run_evals_activity(payload: dict) -> dict:
+    """Compute prediction accuracy and emit scores to Langfuse."""
+    from grocery_buddy.evals import run_evals, check_cost_alert
+    user_id = payload["user_id"]
+    run_cost_usd = payload.get("run_cost_usd", 0.0)
+
+    await check_cost_alert(run_cost_usd, user_id)
+    return await run_evals(user_id)
