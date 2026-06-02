@@ -1,0 +1,41 @@
+# Environment
+.env
+.env.local
+
+# Amazon browser session (contains login cookies — never commit)
+.amazon-session/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+.eggs/
+
+# uv
+.python-version
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Ruff
+.ruff_cache/
+
+# Playwright
+playwright-report/
+test-results/
+
+# Temporal local data
+temporal-data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

@@ -1,0 +1,59 @@
+[project]
+name = "grocery-buddy"
+version = "0.1.0"
+description = "24/7 autonomous grocery agent — pantry tracking, prediction, Amazon automation, approval-gated purchasing"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.50",
+    "temporalio>=1.7",
+    "playwright>=1.45",
+    "asyncpg>=0.29",
+    "supabase>=2.0",
+    "langfuse>=2.50",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "httpx>=0.27",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "python-dotenv>=1.0",
+    "mcp[cli]>=1.0",
+    "croniter>=2.0",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+grocery-buddy = "grocery_buddy.cli:main"
+grocery-mcp = "grocery_buddy.mcp_server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/grocery_buddy"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
