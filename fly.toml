@@ -1,0 +1,56 @@
+app = "grocery-buddy"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Two processes: the Temporal worker (no port) + the webhook server (public)
+[processes]
+  worker = "uv run grocery-buddy worker"
+  webhook = "uv run grocery-buddy webhook --port 8080"
+
+[env]
+  TEMPORAL_HOST = "grocery-buddy-temporal.internal:7233"
+  AMAZON_HEADLESS = "true"
+
+# Webhook server gets the public HTTP service
+[[services]]
+  processes = ["webhook"]
+  internal_port = 8080
+  protocol = "tcp"
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+# Worker gets no public port
+[[vm]]
+  processes = ["worker"]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[[vm]]
+  processes = ["webhook"]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+# Persistent volume for Amazon browser session
+[[mounts]]
+  source = "amazon_session"
+  destination = "/app/.amazon-session"
+  processes = ["worker"]

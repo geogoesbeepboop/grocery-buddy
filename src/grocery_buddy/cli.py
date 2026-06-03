@@ -115,7 +115,12 @@ async def _create_schedule(user_id: str, cron: str, tz: str) -> None:
         """
         INSERT INTO schedules (user_id, cadence, timezone, enabled, temporal_schedule_id)
         VALUES ($1, $2, $3, TRUE, $4)
-        ON CONFLICT DO NOTHING
+        ON CONFLICT (user_id) DO UPDATE
+          SET cadence = EXCLUDED.cadence,
+              timezone = EXCLUDED.timezone,
+              temporal_schedule_id = EXCLUDED.temporal_schedule_id,
+              enabled = TRUE,
+              updated_at = NOW()
         """,
         uuid_mod.UUID(user_id), cron, tz, schedule_id,
     )
