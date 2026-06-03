@@ -20,8 +20,8 @@ from grocery_buddy.config import settings
 
 logger = logging.getLogger(__name__)
 
-AMAZON_FRESH_URL = "https://www.amazon.com/fmc/storefront"
-AMAZON_GROCERY_SEARCH = "https://www.amazon.com/s?i=grocery&k={query}"
+AMAZON_FRESH_URL = "https://www.amazon.com/fresh"
+AMAZON_GROCERY_SEARCH = "https://www.amazon.com/s?i=amazonfresh&k={query}"
 
 
 async def get_browser_context() -> tuple:
@@ -46,10 +46,10 @@ async def get_browser_context() -> tuple:
 async def is_logged_in(context: BrowserContext) -> bool:
     page = await context.new_page()
     try:
-        await page.goto("https://www.amazon.com/gp/css/homepage.html", timeout=15_000)
+        await page.goto("https://www.amazon.com", timeout=15_000)
         await page.wait_for_load_state("domcontentloaded")
-        # If we see "Hello, sign in" the session is gone
-        sign_in_visible = await page.locator("text=Hello, sign in").is_visible()
+        # Logged-in state shows the account name; signed-out shows "Hello, sign in"
+        sign_in_visible = await page.locator("#nav-link-accountList-nav-line-1:has-text('Sign in')").is_visible()
         return not sign_in_visible
     except Exception as exc:
         logger.warning("Login check failed: %s", exc)

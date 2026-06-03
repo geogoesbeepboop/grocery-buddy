@@ -1,0 +1,37 @@
+# Shared Temporal server — used by ALL agents
+# Deploy once; every agent worker points TEMPORAL_HOST here.
+#
+# Deploy:
+#   cd infra/temporal
+#   flyctl launch --name temporal-cluster --region iad --no-deploy
+#   flyctl postgres create --name temporal-db --region iad
+#   flyctl secrets set DB=postgres12 POSTGRES_USER=... POSTGRES_PWD=... POSTGRES_SEEDS=temporal-db.internal
+#   flyctl deploy
+
+app = "temporal-cluster"
+primary_region = "iad"
+
+[build]
+  image = "temporalio/auto-setup:latest"
+
+[env]
+  DB = "postgres12"
+  DB_PORT = "5432"
+  # POSTGRES_USER, POSTGRES_PWD, POSTGRES_SEEDS set as Fly secrets
+
+[[services]]
+  internal_port = 7233
+  protocol = "tcp"
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  # Expose gRPC on 7233 (agents connect here)
+  [[services.ports]]
+    port = 7233
+    handlers = ["tls"]
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1

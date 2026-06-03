@@ -1,3 +1,9 @@
+# Shared local Temporal stack — run this once, point all agent workers at localhost:7233
+#
+# Usage: docker compose -f infra/temporal/docker-compose.yml up -d
+#
+# Or just use the project-level docker-compose.yml for single-agent local dev.
+
 services:
   temporal:
     image: temporalio/auto-setup:latest

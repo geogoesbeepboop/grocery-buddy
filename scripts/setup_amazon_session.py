@@ -14,7 +14,7 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 
 PROFILE_DIR = Path(".amazon-session").resolve()
-AMAZON_URL = "https://www.amazon.com/gp/css/homepage.html"
+AMAZON_URL = "https://www.amazon.com"
 
 
 async def main() -> None:
