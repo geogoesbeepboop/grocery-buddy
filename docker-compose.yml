@@ -1,6 +1,6 @@
 services:
   temporal:
-    image: temporalio/auto-setup:1.24
+    image: temporalio/auto-setup:latest
     ports:
       - "7233:7233"
     environment:
@@ -10,7 +10,8 @@ services:
       - POSTGRES_PWD=temporal
       - POSTGRES_SEEDS=temporal-db
     depends_on:
-      - temporal-db
+      temporal-db:
+        condition: service_healthy
 
   temporal-db:
     image: postgres:16-alpine
@@ -20,13 +21,20 @@ services:
       - POSTGRES_DB=temporal
     volumes:
       - temporal-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   temporal-ui:
-    image: temporalio/ui:2.26
+    image: temporalio/ui:latest
     ports:
       - "8088:8080"
     environment:
       - TEMPORAL_ADDRESS=temporal:7233
+    depends_on:
+      - temporal
 
 volumes:
   temporal-data:
