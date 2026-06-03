@@ -9,6 +9,11 @@ services:
       - POSTGRES_USER=temporal
       - POSTGRES_PWD=temporal
       - POSTGRES_SEEDS=temporal-db
+      # Enables the "Workers" tab in the UI (worker heartbeats). See infra/temporal-dynamicconfig.yaml.
+      # Absolute path so the server finds it regardless of working directory.
+      - DYNAMIC_CONFIG_FILE_PATH=/etc/temporal/config/dynamicconfig/docker.yaml
+    volumes:
+      - ./infra/temporal-dynamicconfig.yaml:/etc/temporal/config/dynamicconfig/docker.yaml:ro
     depends_on:
       temporal-db:
         condition: service_healthy

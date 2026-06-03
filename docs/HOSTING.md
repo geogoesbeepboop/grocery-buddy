@@ -257,3 +257,88 @@ All other config stays the same — your `.env` points to localhost for local de
 - Langfuse: watch cost-per-run trend; set alert in `evals.py` `COST_ALERT_THRESHOLD_USD`
 - Fly.io dashboard: confirm worker + webhook processes are both `running`
 - ntfy: test push delivery weekly (trigger a manual run above the cap)
+
+---
+
+## Why Fly.io (and why ntfy alone isn't enough)
+
+These are two different things people conflate:
+
+- **ntfy (the phone app)** is a *notification receiver*. It shows the morning
+  briefing and the Approve/Reject buttons. It is the **output/UI**, and yes — it
+  is enough for receiving pushes and tapping approve. You don't need anything
+  else for that half.
+- **Fly.io (or any always-on host)** is where the *agent itself* runs — the
+  Temporal **worker** and the **webhook server**. These are long-running
+  programs that must be awake 24/7:
+    - The **worker** is what fires the 8am scheduled run, prices items, drives
+      Playwright, and waits (durably) for your approval. If it's only running on
+      your laptop, the agent stops the moment your laptop sleeps.
+    - The **webhook server** is the thing your phone's Approve tap actually calls
+      (`/approve/{workflow_id}`). ntfy → HTTP POST → webhook → signals Temporal.
+      If nothing is listening at `WEBHOOK_BASE_URL`, the tap goes nowhere.
+
+So: **ntfy = your phone receiving and answering. Fly.io = the brain that's always
+on.** A "Fly app" is just a deployed container — `flyctl deploy` packages this
+repo's Docker image and runs the `worker` and `webhook` processes on a small
+always-on VM. Fly is not special; it's just a cheap, simple always-on host. Any
+of these would also work: a $5 VPS (DigitalOcean/Hetzner), a Raspberry Pi at
+home, a home server, or Railway/Render. The only hard requirement is **a machine
+that never sleeps and is reachable from the internet** (for the webhook). If you
+already have an always-on box, you can skip Fly entirely.
+
+> For local dev you run the worker + webhook on your laptop and expose the
+> webhook with `ngrok` (see `make dev`). That's fine for testing but not 24/7.
+
+---
+
+## Two-way conversational channel (Telegram — built)
+
+The agent talks to you through **ntfy push + tappable buttons** and now also
+through a **Telegram bot** for free-text, two-way chat. You can also drive it
+locally with the CLI: `grocery-buddy ask "I need eggs early"`.
+
+### How it fits together
+
+```
+You (Telegram)  ──text──▶  POST /telegram (webhook.py)
+                              │  parse_request()  (agents/assistant.py, Haiku)
+                              ▼
+                         QuickBuyWorkflow ──prices brand-aware──▶ draft cart
+                              │
+                              ▼  approval prompt (ntfy + Telegram inline buttons)
+You tap ✅/❌  ──callback──▶  /telegram (or /approve,/reject) ──signal──▶ workflow
+                              ▼
+                         execute purchase
+```
+
+- Free text like *"I need eggs earlier than expected"* → `parse_request()` →
+  starts `QuickBuyWorkflow` for just those items, always approval-gated.
+- Approval prompts are sent to **both** ntfy and Telegram (inline ✅/❌ buttons).
+  Telegram button taps carry `callback_data` like `approve:{workflow_id}` and are
+  signaled back to Temporal by the same `/telegram` route.
+- Replies like *"actually buy me the oat milk too"* route through the same
+  `parse_request()`.
+
+### Setup
+
+1. Create a bot with **@BotFather**, copy the token.
+2. DM the bot once, then read your chat id from
+   `https://api.telegram.org/bot<TOKEN>/getUpdates`.
+3. Set in `.env`: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `GROCERY_BUDDY_USER_ID`.
+4. Register the webhook (once):
+   ```bash
+   curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=$WEBHOOK_BASE_URL/telegram"
+   ```
+   `WEBHOOK_BASE_URL` must be the public URL of the webhook server (ngrok for
+   local dev; the Fly app URL in production).
+
+Only messages from `TELEGRAM_CHAT_ID` are acted on; anything else is ignored.
+
+### Still open / future
+- **Morning briefing over Telegram:** the daily run currently notifies via ntfy.
+  Sending the briefing as a Telegram message (so the "actually buy me this" reply
+  is in the same thread) is a small follow-up — wire the daily-run completion
+  notification to `send_telegram_message`.
+- **Multi-user:** inbound chat is single-user today (`GROCERY_BUDDY_USER_ID`). A
+  chat-id → user mapping table would generalize it.

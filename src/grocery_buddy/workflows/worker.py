@@ -11,17 +11,19 @@ from grocery_buddy.config import settings
 from grocery_buddy.db import close_pool
 from grocery_buddy.workflows.activities import (
     build_draft_cart,
-    execute_purchase_activity,
     load_user_data,
     lookup_amazon_prices,
     lookup_kroger_prices,
+    notify_activity,
     predict_low_items_activity,
+    prepare_checkout_activity,
     run_evals_activity,
     send_approval_notification,
-    send_purchase_confirmation_activity,
+    send_checkout_link_activity,
     update_cart_status,
 )
 from grocery_buddy.workflows.grocery_run import GroceryRunWorkflow
+from grocery_buddy.workflows.quick_buy import QuickBuyWorkflow
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +37,7 @@ async def run_worker() -> None:
     worker = Worker(
         client,
         task_queue=settings.temporal_task_queue,
-        workflows=[GroceryRunWorkflow],
+        workflows=[GroceryRunWorkflow, QuickBuyWorkflow],
         activities=[
             load_user_data,
             predict_low_items_activity,
@@ -44,8 +46,9 @@ async def run_worker() -> None:
             build_draft_cart,
             send_approval_notification,
             update_cart_status,
-            execute_purchase_activity,
-            send_purchase_confirmation_activity,
+            prepare_checkout_activity,
+            send_checkout_link_activity,
+            notify_activity,
             run_evals_activity,
         ],
     )

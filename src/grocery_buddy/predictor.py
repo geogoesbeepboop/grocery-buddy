@@ -41,6 +41,30 @@ class LowItemResult:
     par_level: float
 
 
+# ── Stock-level buckets ─────────────────────────────────────────────────────────
+# A single vocabulary shared by /status (what's in the pantry) and the grocery run
+# (what to buy). "low" is exactly the predict_low_items set; "large" items are the
+# ones a scheduled run safely skips.
+LOW = "low"
+MEDIUM = "medium"
+LARGE = "large"
+
+# Items with at most this many days of stock left (but more than the low
+# threshold) are "medium"; more than this is "large".
+MEDIUM_DAYS = 14.0
+
+
+@dataclass
+class StockLevel:
+    product: str
+    qty: float
+    unit: str
+    days_remaining: float  # float("inf") when we can't estimate (no declared rate)
+    effective_rate: float
+    par_level: float
+    bucket: str  # LOW | MEDIUM | LARGE
+
+
 def _as_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
@@ -131,3 +155,60 @@ def predict_low_items(
             ))
 
     return sorted(low, key=lambda x: x.days_remaining)
+
+
+def classify_stock_levels(
+    inventory: list[InventoryItem],
+    profiles: list[ConsumptionProfile],
+    events_by_product: dict[str, list[ConsumptionEvent]],
+    lead_time_days: float = 2.0,
+    buffer_days: float = 1.0,
+    medium_days: float = MEDIUM_DAYS,
+) -> list[StockLevel]:
+    """Bucket every pantry item into low / medium / large stock.
+
+    Same urgency math as ``predict_low_items`` (the LOW bucket is exactly the set
+    that function returns), extended to cover the items we *don't* need to buy yet
+    so /status can show the whole pantry and a scheduled run can skip the large
+    ones. Items without a declared rate are bucketed by how their qty compares to
+    their par level. Sorted most-urgent first.
+    """
+    profile_map = {p.product: p for p in profiles}
+    levels: list[StockLevel] = []
+
+    for item in inventory:
+        profile = profile_map.get(item.product)
+
+        if profile is None:
+            # No declared rate — fall back to par-level ratio.
+            rate = 0.0
+            d_left = float("inf")
+            par = item.par_level or 0.0
+            if item.qty <= par:
+                bucket = LOW
+            elif item.qty <= 2 * par:
+                bucket = MEDIUM
+            else:
+                bucket = LARGE
+        else:
+            events = events_by_product.get(item.product, [])
+            rate = effective_daily_rate(profile, events)
+            d_left = days_left(item, rate)
+            if d_left <= lead_time_days + buffer_days:
+                bucket = LOW
+            elif d_left <= medium_days:
+                bucket = MEDIUM
+            else:
+                bucket = LARGE
+
+        levels.append(StockLevel(
+            product=item.product,
+            qty=item.qty,
+            unit=item.unit,
+            days_remaining=d_left,
+            effective_rate=rate,
+            par_level=item.par_level,
+            bucket=bucket,
+        ))
+
+    return sorted(levels, key=lambda x: x.days_remaining)

@@ -5,6 +5,8 @@ from uuid import UUID
 
 import asyncpg
 
+from grocery_buddy.products import normalize_product
+
 
 async def get_consumption_profile(pool: asyncpg.Pool, user_id: str) -> list[dict]:
     rows = await pool.fetch(
@@ -22,21 +24,28 @@ async def upsert_consumption_profile(
     unit: str,
     household_factor: float = 1.0,
     notes: str = "",
+    preferred_brand: str | None = None,
+    brand_flexibility: str = "any",
 ) -> dict:
+    product = normalize_product(product)
     row = await pool.fetchrow(
         """
         INSERT INTO consumption_profile
-            (user_id, product, declared_rate, unit, household_factor, notes, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            (user_id, product, declared_rate, unit, household_factor, notes,
+             preferred_brand, brand_flexibility, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
         ON CONFLICT (user_id, product) DO UPDATE
         SET declared_rate = EXCLUDED.declared_rate,
             unit = EXCLUDED.unit,
             household_factor = EXCLUDED.household_factor,
             notes = EXCLUDED.notes,
+            preferred_brand = EXCLUDED.preferred_brand,
+            brand_flexibility = EXCLUDED.brand_flexibility,
             updated_at = NOW()
         RETURNING *
         """,
         UUID(user_id), product, declared_rate, unit, household_factor, notes,
+        preferred_brand, brand_flexibility,
     )
     return _row(row)
 

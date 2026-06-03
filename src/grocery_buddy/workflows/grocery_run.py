@@ -50,10 +50,37 @@ class GroceryRunWorkflow:
     async def reject(self) -> None:
         self._decision = "rejected"
 
+    async def _notify(self, message: str) -> None:
+        """Best-effort user-facing message so a run never ends in silence."""
+        await workflow.execute_activity(
+            "notify_activity",
+            {"message": message},
+            schedule_to_close_timeout=_SHORT_TIMEOUT,
+            retry_policy=_STANDARD_RETRY,
+        )
+
     @workflow.run
     async def run(self, payload: GroceryRunInput) -> GroceryRunResult:
+        # Top-level safety net: if any step fails unexpectedly (e.g. an activity
+        # exhausts its retries), tell the user instead of leaving them waiting on a
+        # reply that never comes.
+        try:
+            return await self._run(payload)
+        except Exception as exc:
+            workflow.logger.error("Grocery run failed unexpectedly: %s", exc)
+            try:
+                await self._notify(
+                    "Something went wrong on my end and I couldn't finish that. "
+                    "Mind trying again in a few minutes?"
+                )
+            except Exception:
+                pass
+            raise
+
+    async def _run(self, payload: GroceryRunInput) -> GroceryRunResult:
         user_id = payload.user_id
         workflow_id = workflow.info().workflow_id
+        is_scheduled = payload.trigger == "schedule"
 
         # ── 1. Load user data ─────────────────────────────────────────────────
         user_data = await workflow.execute_activity(
@@ -62,6 +89,29 @@ class GroceryRunWorkflow:
             schedule_to_close_timeout=_SHORT_TIMEOUT,
             retry_policy=_STANDARD_RETRY,
         )
+
+        # ── 1b. Guardrails ────────────────────────────────────────────────────
+        # Never stack on top of a cart still awaiting approval (would create a
+        # confusing second pending cart). For user-initiated runs, tell them why
+        # instead of going silent. For scheduled runs, stay quiet.
+        if user_data.get("open_cart_exists"):
+            workflow.logger.info("Skipping run for %s — a cart is awaiting approval", user_id)
+            if not is_scheduled:
+                await self._notify(
+                    "You've still got a grocery list waiting for your okay — reply to that "
+                    "one first (just say yes, no, or tell me what to change) and I'll take it "
+                    "from there."
+                )
+            return GroceryRunResult(
+                status="skipped", message="A previous cart is still awaiting your approval"
+            )
+        # The cooldown only exists to stop a high-frequency cron from spamming —
+        # it must never block a run the user explicitly asked for.
+        if is_scheduled and user_data.get("recent_run_exists"):
+            workflow.logger.info("Skipping scheduled run for %s — within cooldown window", user_id)
+            return GroceryRunResult(
+                status="skipped", message="Already ran recently (within cooldown window)"
+            )
 
         # ── 2. Predict low items ──────────────────────────────────────────────
         low_items = await workflow.execute_activity(
@@ -73,17 +123,33 @@ class GroceryRunWorkflow:
 
         if not low_items:
             workflow.logger.info("Pantry well stocked for user %s", user_id)
+            if not is_scheduled:
+                await self._notify(
+                    "Good news — you look well stocked right now, so there's nothing I'd add "
+                    "to a cart. I'll keep an eye on things."
+                )
             return GroceryRunResult(status="no_items_needed", message="Pantry is well stocked")
 
-        # ── 3. Amazon price lookup ────────────────────────────────────────────
+        # ── 3. Amazon price lookup (brand-aware) ──────────────────────────────
+        brand_prefs = {
+            prof["product"]: {
+                "preferred_brand": prof.get("preferred_brand"),
+                "brand_flexibility": prof.get("brand_flexibility", "any"),
+            }
+            for prof in user_data.get("profiles", [])
+        }
         priced_items = await workflow.execute_activity(
             "lookup_amazon_prices",
-            {"user_id": user_id, "items": low_items},
+            {"user_id": user_id, "items": low_items, "brand_prefs": brand_prefs},
             schedule_to_close_timeout=_ACTIVITY_TIMEOUT,
             retry_policy=_STANDARD_RETRY,
         )
 
         if not priced_items:
+            await self._notify(
+                "I tried to price what you're low on, but couldn't pull anything usable from "
+                "Amazon just now — might be a hiccup on their end. Try again in a few minutes?"
+            )
             return GroceryRunResult(status="failed", message="Could not price any items on Amazon")
 
         # ── 4. Build draft cart ───────────────────────────────────────────────
@@ -97,35 +163,15 @@ class GroceryRunWorkflow:
         cart_id: str = cart["cart_id"]
         total_usd: float = cart["total_usd"]
         item_count: int = cart["item_count"]
-        auto_cap: float = user_data.get("auto_purchase_cap", 50.0)
         idempotency_key = f"purchase-{cart_id}"
 
         workflow.logger.info(
-            "Cart %s built: $%.2f (%d items), cap=$%.2f",
-            cart_id, total_usd, item_count, auto_cap,
+            "Cart %s built: $%.2f (%d items)", cart_id, total_usd, item_count,
         )
 
-        # ── 5a. Auto-purchase (under cap) ─────────────────────────────────────
-        if total_usd <= auto_cap:
-            await workflow.execute_activity(
-                "execute_purchase_activity",
-                {"cart_id": cart_id, "user_id": user_id, "idempotency_key": idempotency_key},
-                schedule_to_close_timeout=_PURCHASE_TIMEOUT,
-                retry_policy=_NO_RETRY,
-            )
-            await workflow.execute_activity(
-                "run_evals_activity",
-                {"user_id": user_id, "run_cost_usd": 0.0},
-                schedule_to_close_timeout=_SHORT_TIMEOUT,
-                retry_policy=_STANDARD_RETRY,
-            )
-            return GroceryRunResult(
-                status="purchased",
-                cart_id=cart_id,
-                message=f"Auto-purchased ${total_usd:.2f} (under ${auto_cap:.0f} cap)",
-            )
-
-        # ── 5b. Over cap — send push, wait for approval signal ────────────────
+        # ── 5. Always require approval ────────────────────────────────────────
+        # We never auto-buy. The user must see the itemized list and explicitly
+        # approve before we stage an Amazon cart + hand back a checkout link.
         await workflow.execute_activity(
             "send_approval_notification",
             {"cart_id": cart_id, "total_usd": total_usd, "item_count": item_count, "workflow_id": workflow_id},
@@ -159,7 +205,7 @@ class GroceryRunWorkflow:
                 retry_policy=_STANDARD_RETRY,
             )
             await workflow.execute_activity(
-                "execute_purchase_activity",
+                "prepare_checkout_activity",
                 {"cart_id": cart_id, "user_id": user_id, "idempotency_key": idempotency_key},
                 schedule_to_close_timeout=_PURCHASE_TIMEOUT,
                 retry_policy=_NO_RETRY,
@@ -170,7 +216,7 @@ class GroceryRunWorkflow:
                 schedule_to_close_timeout=_SHORT_TIMEOUT,
                 retry_policy=_STANDARD_RETRY,
             )
-            return GroceryRunResult(status="purchased", cart_id=cart_id)
+            return GroceryRunResult(status="checkout_ready", cart_id=cart_id)
 
         # Rejected or expired
         await workflow.execute_activity(

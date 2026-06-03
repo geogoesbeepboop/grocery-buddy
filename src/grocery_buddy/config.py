@@ -24,13 +24,26 @@ class Settings(BaseSettings):
     langfuse_secret_key: str = ""
     langfuse_host: str = "https://cloud.langfuse.com"
 
-    # ntfy
-    ntfy_url: str = "https://ntfy.sh"
-    ntfy_topic: str = "grocery-buddy"
+    # Public URL where this webhook server is reachable (used only to register
+    # the Telegram webhook — the Telegram Bot API calls this URL).
+    # For local dev use ngrok: ngrok http 8080
     webhook_base_url: str = "http://localhost:8080"
+
+    # Telegram — all notifications and inbound chat
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""   # your DM with the bot (from getUpdates)
+
+    # Single-user: all inbound Telegram chat messages are attributed to this user
+    grocery_buddy_user_id: str = ""
 
     # Purchase
     auto_purchase_cap_usd: float = 50.0
+
+    # Scheduled-run guardrail: skip a new full grocery run if one already ran
+    # for the user within this many minutes (prevents repeated auto-purchases /
+    # stacked briefings on a high-frequency cron like */5). Ad-hoc QuickBuys are
+    # never blocked by this.
+    run_cooldown_minutes: int = 180
 
     # Amazon automation
     amazon_profile_dir: str = ".amazon-session"

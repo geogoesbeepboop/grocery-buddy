@@ -84,6 +84,28 @@ class UserPreferences:
 @dataclass
 class GroceryRunInput:
     user_id: str
+    # What kicked off this run. "schedule" runs honor the anti-spam cooldown and
+    # stay quiet on no-op outcomes; user-initiated runs ("manual"/"onboarding")
+    # bypass the cooldown and always report back so the user is never left hanging.
+    trigger: str = "manual"
+
+
+@dataclass
+class QuickBuyItem:
+    product: str
+    qty: float = 1.0
+    unit: str = ""  # resolved from the user's profile when blank
+    # Optional inline brand override, e.g. the user replies "get Eggland's Best
+    # eggs instead". Takes precedence over the stored consumption-profile pref.
+    preferred_brand: str | None = None
+
+
+@dataclass
+class QuickBuyInput:
+    """Ad-hoc 'buy me X right now' request, e.g. 'I need eggs earlier than expected'."""
+    user_id: str
+    items: list[QuickBuyItem] = field(default_factory=list)
+    reason: str = ""  # free-text context from the user, shown in the approval push
 
 
 @dataclass

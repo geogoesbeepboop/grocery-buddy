@@ -5,6 +5,8 @@ from uuid import UUID
 
 import asyncpg
 
+from grocery_buddy.products import normalize_product
+
 
 async def get_inventory(pool: asyncpg.Pool, user_id: str) -> list[dict]:
     rows = await pool.fetch(
@@ -22,6 +24,7 @@ async def upsert_inventory_item(
     unit: str,
     par_level: float = 1.0,
 ) -> dict:
+    product = normalize_product(product)
     row = await pool.fetchrow(
         """
         INSERT INTO inventory_items (user_id, product, qty, unit, par_level, updated_at)
@@ -44,6 +47,7 @@ async def log_consumption_event(
     source: str = "user_update",
 ) -> None:
     """Record a consumption event and update the inventory qty accordingly."""
+    product = normalize_product(product)
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute(

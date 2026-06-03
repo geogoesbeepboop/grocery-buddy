@@ -1,4 +1,4 @@
-.PHONY: help dev install test lint temporal worker webhook run onboard evals mcp docker-build
+.PHONY: help dev install test lint temporal worker webhook run ask onboard evals mcp docker-build
 
 USER_ID ?= $(shell grep GROCERY_BUDDY_USER_ID .env.local 2>/dev/null | cut -d= -f2)
 
@@ -48,6 +48,11 @@ onboard: ## Run conversational onboarding (USER_ID required)
 run: ## Trigger one grocery run (USER_ID required)
 	@[ "$(USER_ID)" ] || (echo "Set USER_ID=<uuid>"; exit 1)
 	uv run grocery-buddy run --user-id "$(USER_ID)"
+
+ask: ## Talk to the agent (USER_ID + MSG required), e.g. make ask MSG="I need eggs early"
+	@[ "$(USER_ID)" ] || (echo "Set USER_ID=<uuid>"; exit 1)
+	@[ "$(MSG)" ] || (echo "Usage: make ask MSG='I need eggs early'"; exit 1)
+	uv run grocery-buddy ask --user-id "$(USER_ID)" $(MSG)
 
 schedule: ## Set daily 8am schedule (USER_ID required)
 	@[ "$(USER_ID)" ] || (echo "Set USER_ID=<uuid>"; exit 1)

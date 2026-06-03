@@ -1,0 +1,14 @@
+# Temporal dynamic config (local dev).
+#
+# Mounted into the auto-setup container at
+# /etc/temporal/config/dynamicconfig/docker.yaml (see docker-compose.yml).
+#
+# workerHeartbeatsEnabled powers the "Workers" tab in the Temporal UI. Without
+# it the UI shows "Worker Heartbeats Disabled" even though the worker is running
+# fine and polling its task queue — the flag is purely about UI visibility.
+frontend.workerHeartbeatsEnabled:
+  - value: true
+
+# Let workers report richer command/capability metadata to the same UI tab.
+frontend.enableExecuteMultiOperation:
+  - value: true

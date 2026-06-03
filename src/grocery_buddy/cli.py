@@ -59,9 +59,52 @@ async def _run_workflow(user_id: str) -> None:
 
 
 @main.command()
+@click.option("--user-id", required=True, help="User UUID making the request")
+@click.argument("message", nargs=-1, required=True)
+def ask(user_id: str, message: tuple[str, ...]) -> None:
+    """Talk to the agent: 'grocery-buddy ask --user-id <uuid> I need eggs early'.
+
+    Parses the request; if it's a purchase, kicks off an approval-gated QuickBuy
+    workflow (you'll get an ntfy push to approve before anything is bought).
+    """
+    asyncio.run(_ask(user_id, " ".join(message)))
+
+
+async def _ask(user_id: str, message: str) -> None:
+    import uuid
+
+    from temporalio.client import Client
+
+    from grocery_buddy.agents.assistant import parse_request
+    from grocery_buddy.config import settings
+    from grocery_buddy.models import QuickBuyInput, QuickBuyItem
+    from grocery_buddy.workflows.quick_buy import QuickBuyWorkflow
+
+    intent = await parse_request(message)
+
+    if intent["action"] != "quick_buy":
+        click.echo(intent["reply"])
+        return
+
+    items = [QuickBuyItem(product=i["product"], qty=i["qty"], unit=i["unit"]) for i in intent["items"]]
+    summary = ", ".join(f"{i.qty:g} {i.product}" for i in items)
+    click.echo(f"Got it — requesting: {summary}")
+
+    client = await Client.connect(settings.temporal_host, namespace=settings.temporal_namespace)
+    handle = await client.start_workflow(
+        QuickBuyWorkflow.run,
+        QuickBuyInput(user_id=user_id, items=items, reason=intent.get("reason", "")),
+        id=f"quick-buy-{user_id}-{uuid.uuid4().hex[:8]}",
+        task_queue=settings.temporal_task_queue,
+    )
+    click.echo(f"Started workflow: {handle.id}")
+    click.echo("You'll get a push notification to approve before anything is purchased.")
+
+
+@main.command()
 @click.option("--port", default=8080, help="Port for the webhook server")
 def webhook(port: int) -> None:
-    """Start the approval webhook server (receives ntfy Approve/Reject taps)."""
+    """Start the webhook server (receives Telegram messages and button callbacks)."""
     import uvicorn
     from grocery_buddy.webhook import app
     uvicorn.run(app, host="0.0.0.0", port=port)
