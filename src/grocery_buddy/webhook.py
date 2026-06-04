@@ -15,17 +15,22 @@ Button tap (callback_query)
   → parse action:workflow_id from callback_data
   → signal Temporal workflow
 
-Free-text message
+Free-text message  (full tree: docs/SYSTEM_REFERENCE.md §6)
+  → conversation mode onboarding / import_review → that turn handler
   → check DB for a pending cart for this user
   → if pending cart: parse_briefing_reply(text, cart_items)
-      approve         → signal approve
-      reject          → signal reject
-      approve_and_add → signal approve + start QuickBuyWorkflow for extras
-      reject_and_buy  → signal reject + start QuickBuyWorkflow for subset
-      chat            → send reply text
-  → else: parse_request(text)
-      quick_buy → start QuickBuyWorkflow
-      chat      → send reply text
+      approve            → signal approve (checkout the pending cart)
+      buy_items          → signal reject + start QuickBuyWorkflow (new cart from
+                           the named items; the suggestion is set aside)
+      reject             → signal reject (done)
+      reject_and_restart → signal reject + start a fresh GroceryRun
+      update_inventory   → correct stock + reject + rebuild
+      chat               → send reply text + re-show the cart
+  → else: parse_request(text, stock_snapshot)
+      quick_buy          → start QuickBuyWorkflow
+      start_grocery_run  → start GroceryRunWorkflow (manual) — "buy what I'm low on"
+      update_inventory / update_schedule
+      chat               → send reply text
 
 Setup (one-time)
 ────────────────
@@ -44,17 +49,29 @@ from grocery_buddy.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Shared user-facing copy, so the same action reads the same everywhere (the button
+# reject and the text-reply reject were drifting apart).
+_MSG_SKIPPED = "❌ Skipped — nothing added."
+_MSG_ERROR = "Hmm, something hiccuped on my end — try that again in a sec?"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """On startup: detect user state and proactively start the right conversation."""
-    from grocery_buddy.notifications import send_telegram_message, telegram_enabled
+    from grocery_buddy.notifications import (
+        register_bot_commands,
+        send_telegram_message,
+        telegram_enabled,
+    )
 
     if not telegram_enabled():
         logger.warning("Telegram not configured — no startup ping sent")
         yield
         logger.info("Webhook server shutting down")
         return
+
+    # Publish the slash-command menu so /import, /status, etc. autocomplete.
+    await register_bot_commands()
 
     user_id = settings.grocery_buddy_user_id
     if not user_id:
@@ -96,8 +113,9 @@ async def lifespan(app: FastAPI):
             await send_telegram_message(
                 "👋 <b>Grocery Buddy is online.</b>\n\n"
                 f"{sched_line}\n\n"
-                "Say <i>\"I need eggs early\"</i> to order something now, "
-                "or <i>\"/status\"</i> to see your pantry."
+                "Say <i>\"grab some coffee\"</i> to order something now, "
+                "<i>\"buy what I'm low on\"</i> to restock, or <i>/status</i> to see your "
+                "pantry. New here? <i>/help</i>."
             )
             logger.info("Startup greeting sent to chat %s", settings.telegram_chat_id)
 
@@ -134,6 +152,32 @@ async def _signal(workflow_id: str, signal_name: str) -> None:
     handle = client.get_workflow_handle(workflow_id)
     await handle.signal(signal_name)
     logger.info("Signaled workflow %s → %s", workflow_id, signal_name)
+
+
+async def _retire_pending_cart(pending: dict) -> None:
+    """Cleanly close out a pending cart before starting a replacement.
+
+    Signals the workflow to reject AND flips the cart's DB status synchronously.
+    Without the synchronous DB flip, the new run/cart we start next races the old
+    workflow's own status update — which can leave two carts pending_approval at
+    once, or trip the open-cart guard so a user-requested rebuild silently no-ops.
+    """
+    from grocery_buddy.db import get_pool
+
+    wf = pending.get("workflow_id")
+    if wf:
+        try:
+            await _signal(wf, "reject")
+        except Exception as exc:
+            logger.warning("Reject signal failed for %s: %s", wf, exc)
+    cart_id = pending.get("cart_id")
+    if cart_id:
+        pool = await get_pool()
+        await pool.execute(
+            "UPDATE carts SET status = 'rejected', updated_at = NOW() "
+            "WHERE id = $1 AND status = 'pending_approval'",
+            uuid.UUID(cart_id),
+        )
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -250,6 +294,72 @@ async def _start_grocery_run(user_id: str, trigger: str = "manual") -> str:
     return wf_id
 
 
+async def _start_import_history(user_id: str) -> None:
+    """Kick off an Amazon order-history import (scrape → synthesize → review).
+
+    The heavy work runs in ImportHistoryWorkflow; we just acknowledge fast and let
+    the workflow send the proposal when it's ready.
+    """
+    from grocery_buddy.models import ImportHistoryInput
+    from grocery_buddy.notifications import send_telegram_message
+    from grocery_buddy.workflows.import_history import ImportHistoryWorkflow
+
+    wf_id = f"import-history-{user_id}-{uuid.uuid4().hex[:8]}"
+    try:
+        client = await _get_client()
+        await client.start_workflow(
+            ImportHistoryWorkflow.run,
+            ImportHistoryInput(user_id=user_id),
+            id=wf_id,
+            task_queue=settings.temporal_task_queue,
+        )
+        await send_telegram_message(
+            "🔎 Reading through your recent Amazon orders to draft your pantry — this "
+            "takes a minute. I'll send what I find so you can fix anything before I save it."
+        )
+    except Exception as exc:
+        logger.error("Failed to start import workflow: %s", exc)
+        await send_telegram_message(
+            "I couldn't start the Amazon import just now (is the worker running?). "
+            "We can set up by hand instead — just tell me what's in your pantry."
+        )
+
+
+async def _handle_amazon_2fa_code(user_id: str, text: str) -> None:
+    """Relay the user's Amazon 2FA code back to the waiting re-login activity.
+
+    The user is in ``amazon_2fa`` mode because a re-login activity asked them for
+    the one-time code Amazon just sent. We write the digits onto their pending
+    challenge (the activity is polling for it) and hand control back — the activity
+    enters it and continues the import.
+    """
+    from grocery_buddy.db import get_pool
+    from grocery_buddy.notifications import send_telegram_message
+    from grocery_buddy.tools.auth import submit_otp_code
+    from grocery_buddy.tools.conversation import set_conversation
+
+    code = "".join(c for c in text if c.isdigit())
+    pool = await get_pool()
+
+    if not code:
+        await send_telegram_message(
+            "I just need the numeric code Amazon sent you (e.g. <b>123456</b>). "
+            "Reply with that, or say /import to start over."
+        )
+        return
+
+    accepted = await submit_otp_code(pool, user_id, code)
+    # Hand control back to the activity; it owns the next message either way.
+    await set_conversation(pool, user_id, "idle", [])
+    if accepted:
+        await send_telegram_message("Thanks — entering that now…")
+    else:
+        await send_telegram_message(
+            "That code isn't needed anymore — I may have already timed out waiting. "
+            "Say /import to try again."
+        )
+
+
 # ── Telegram webhook ──────────────────────────────────────────────────────────
 
 
@@ -277,7 +387,7 @@ async def telegram(request: Request) -> dict:
                     "✅ On it — adding everything to your Amazon cart. "
                     "I'll send your checkout link in a moment."
                     if action == "approve"
-                    else "❌ Skipped — nothing added."
+                    else _MSG_SKIPPED
                 )
                 await send_telegram_message(label)
             except Exception as exc:
@@ -304,13 +414,30 @@ async def telegram(request: Request) -> dict:
         )
         return {"ok": True}
 
+    # ── /clear — (hidden, testing only) wipe pantry + habits; not advertised ─
+    # Intentionally absent from /status, /help, and all user-facing copy. Lets the
+    # operator reset to a clean slate so the next message re-triggers onboarding.
+    if text.lower() == "/clear":
+        await _handle_clear(user_id)
+        return {"ok": True}
+
     # ── /start — restart onboarding (also works as first-time init) ────────
     if text.lower() in ("/start", "/restart", "/onboard"):
         await _reset_and_start_onboarding(user_id)
         return {"ok": True}
 
+    # ── /import — bootstrap pantry from Amazon order history ───────────────
+    if text.lower() in ("/import", "/importorders"):
+        await _start_import_history(user_id)
+        return {"ok": True}
+
+    # ── /help — what the bot can do ────────────────────────────────────────
+    if text.lower() == "/help":
+        await _send_help()
+        return {"ok": True}
+
     # ── /status — check what the agent knows about you ─────────────────────
-    if text.lower() in ("/status", "/help"):
+    if text.lower() == "/status":
         await _send_status(user_id)
         return {"ok": True}
 
@@ -320,9 +447,19 @@ async def telegram(request: Request) -> dict:
     pool = await get_pool()
     mode, conv_messages = await get_conversation(pool, user_id)
 
+    # ── Mid-Amazon-relogin: this reply is the 2FA one-time code ────────────
+    if mode == "amazon_2fa":
+        await _handle_amazon_2fa_code(user_id, text)
+        return {"ok": True}
+
     # ── Mid-onboarding: every message is an interview answer ───────────────
     if mode == "onboarding":
         await _handle_onboarding_turn(user_id, text, conv_messages, fresh=False)
+        return {"ok": True}
+
+    # ── Mid-import-review: editing/confirming the synthesized pantry ───────
+    if mode == "import_review":
+        await _handle_import_review_turn(user_id, text, conv_messages)
         return {"ok": True}
 
     # ── First contact ever → start the onboarding interview ────────────────
@@ -376,12 +513,33 @@ async def _send_status(user_id: str) -> None:
         f"{pantry}\n\n"
         f"{pending_info}\n"
         f"{sched_info}\n\n"
-        f"<b>Commands</b>\n"
-        f"/start — redo pantry interview\n"
-        f"/status — this summary\n"
-        f"<i>\"I need eggs early\"</i> — ad-hoc order\n"
-        f"<i>\"run my briefing at 9am daily\"</i> — change schedule\n"
-        f"<i>\"yes\"</i> / <i>\"no\"</i> — reply to a pending briefing"
+        f"<b>Quick commands</b>\n"
+        f"/import — rebuild pantry from your Amazon orders\n"
+        f"/start — set up the pantry by hand\n"
+        f"/help — what I can do\n\n"
+        f"Or just talk to me: <i>\"we're out of milk\"</i>, "
+        f"<i>\"buy what I'm low on\"</i>, <i>\"run my briefing at 9am daily\"</i>."
+    )
+
+
+async def _send_help() -> None:
+    """A short capabilities message — what the bot does and how to talk to it."""
+    from grocery_buddy.notifications import send_telegram_message
+
+    await send_telegram_message(
+        "👋 <b>I'm Grocery Buddy.</b> I keep an eye on your pantry, figure out what "
+        "you're running low on, and line up an Amazon cart for you — you always "
+        "approve before anything is bought, and you tap the final checkout yourself.\n\n"
+        "<b>Get started</b>\n"
+        "/import — build your pantry from recent Amazon orders (fastest)\n"
+        "/start — set it up by hand instead\n\n"
+        "<b>Anytime, just talk to me</b>\n"
+        "• <i>\"we're out of milk\"</i> / <i>\"still have plenty of eggs\"</i> — keep stock honest\n"
+        "• <i>\"grab some coffee\"</i> — order something now\n"
+        "• <i>\"buy what I'm low on\"</i> — restock everything that's low\n"
+        "• <i>\"run my briefing at 8am daily\"</i> — set your schedule\n"
+        "• <i>/status</i> — see your pantry, any waiting list, and your schedule\n\n"
+        "When I send a list, reply <i>yes</i> to order it or <i>no</i> to skip."
     )
 
 
@@ -401,25 +559,68 @@ def _render_pending_cart(pending: dict) -> str:
     return "\n".join(lines)
 
 
+async def _handle_clear(user_id: str) -> None:
+    """(Hidden) Wipe pantry + habits + history so the user can start from scratch.
+
+    Testing utility only — never referenced in any user-facing command list. We do
+    reply to confirm (the operator typed it), but we don't advertise it.
+    """
+    from grocery_buddy.db import get_pool
+    from grocery_buddy.notifications import send_telegram_message
+    from grocery_buddy.tools.reset import clear_user_data
+
+    try:
+        pool = await get_pool()
+        counts = await clear_user_data(pool, user_id)
+    except Exception as exc:
+        logger.error("Clear failed for %s: %s", user_id, exc)
+        await send_telegram_message("⚠️ Couldn't clear your data — check the server logs.")
+        return
+
+    wiped = (
+        f"{counts.get('inventory_items', 0)} pantry items, "
+        f"{counts.get('consumption_profile', 0)} habits, "
+        f"{counts.get('consumption_events', 0)} events, "
+        f"{counts.get('carts', 0)} carts"
+    )
+    await send_telegram_message(
+        f"🧹 Cleared ({wiped}). You're back to a blank slate — send any message to "
+        "start onboarding again."
+    )
+
+
 async def _reset_and_start_onboarding(user_id: str) -> None:
     """Clear any in-progress conversation and restart the onboarding interview."""
     from grocery_buddy.agents.onboarding import ONBOARDING_OPENER, advance_onboarding
     from grocery_buddy.db import get_pool
     from grocery_buddy.notifications import send_telegram_message
-    from grocery_buddy.tools.conversation import set_conversation
 
     pool = await get_pool()
     messages = [{"role": "user", "content": ONBOARDING_OPENER}]
     try:
-        reply, messages, done = await advance_onboarding(pool, user_id, messages)
+        reply, messages, status = await advance_onboarding(pool, user_id, messages)
     except Exception as exc:
         logger.error("Onboarding init failed: %s", exc)
         await send_telegram_message("Something went wrong starting the interview — try again.")
         return
 
     await send_telegram_message(reply)
-    if done:
-        from grocery_buddy.tools.conversation import clear_conversation
+    await _resolve_onboarding_status(user_id, status, messages)
+
+
+async def _resolve_onboarding_status(user_id: str, status: str, messages: list[dict]) -> None:
+    """Apply the outcome of an onboarding turn: continue, finish, or import."""
+    from grocery_buddy.db import get_pool
+    from grocery_buddy.notifications import send_telegram_message
+    from grocery_buddy.tools.conversation import clear_conversation, set_conversation
+
+    pool = await get_pool()
+    if status == "import_orders":
+        # Hand off to the durable import flow; it will switch the user into
+        # import_review mode and send the proposal when ready.
+        await clear_conversation(pool, user_id)
+        await _start_import_history(user_id)
+    elif status == "done":
         await clear_conversation(pool, user_id)
         await send_telegram_message("All set! 🎉 Checking what you might need…")
         await _start_grocery_run(user_id, trigger="onboarding")
@@ -434,7 +635,6 @@ async def _handle_onboarding_turn(
     from grocery_buddy.agents.onboarding import advance_onboarding
     from grocery_buddy.db import get_pool
     from grocery_buddy.notifications import send_telegram_message
-    from grocery_buddy.tools.conversation import clear_conversation, set_conversation
 
     pool = await get_pool()
 
@@ -444,22 +644,150 @@ async def _handle_onboarding_turn(
         messages.append({"role": "user", "content": text})
 
     try:
-        reply, messages, done = await advance_onboarding(pool, user_id, messages)
+        reply, messages, status = await advance_onboarding(pool, user_id, messages)
     except Exception as exc:
         logger.error("Onboarding turn failed: %s", exc)
         await send_telegram_message("Hmm, something hiccuped — say that again?")
         return
 
     await send_telegram_message(reply)
+    await _resolve_onboarding_status(user_id, status, messages)
 
-    if done:
+
+# ── Order-history import review ───────────────────────────────────────────────
+
+
+async def _handle_import_review_turn(user_id: str, text: str, messages: list[dict]) -> None:
+    """Drive one turn of reviewing/editing the synthesized import proposal."""
+    from grocery_buddy.agents.order_history import advance_import_review
+    from grocery_buddy.db import get_pool
+    from grocery_buddy.notifications import send_telegram_message
+    from grocery_buddy.tools.conversation import clear_conversation, set_conversation
+    from grocery_buddy.tools.imports import get_active_import_proposal, set_proposal_status
+
+    pool = await get_pool()
+    proposal = await get_active_import_proposal(pool, user_id)
+    if not proposal:
+        # Proposal vanished (already confirmed/discarded) — drop back to normal routing.
         await clear_conversation(pool, user_id)
         await send_telegram_message(
-            "All set! 🎉 Let me take a first look at what you might be running low on…"
+            "That import isn't active anymore. Say /import to try again, or just tell me "
+            "what's in your pantry."
         )
-        await _start_grocery_run(user_id, trigger="onboarding")
+        return
+
+    messages.append({"role": "user", "content": text})
+    try:
+        reply, messages, items, outcome = await advance_import_review(
+            pool, user_id, proposal["id"], proposal["items"], messages
+        )
+    except Exception as exc:
+        logger.error("Import review turn failed: %s", exc)
+        await send_telegram_message("Hmm, something hiccuped reviewing that — say it again?")
+        return
+
+    if outcome == "confirm":
+        await _finalize_import(user_id, proposal["id"], items, reply)
+    elif outcome == "cancel":
+        await set_proposal_status(pool, proposal["id"], "discarded")
+        await clear_conversation(pool, user_id)
+        await send_telegram_message(
+            (reply + "\n\n" if reply else "")
+            + "No problem — I scrapped that. Tell me what's in your pantry whenever you're "
+            "ready, or say /import to try again."
+        )
     else:
-        await set_conversation(pool, user_id, "onboarding", messages)
+        if reply:
+            await send_telegram_message(reply)
+        await set_conversation(pool, user_id, "import_review", messages)
+
+
+async def _finalize_import(
+    user_id: str, proposal_id: str, items: list[dict], reply: str
+) -> None:
+    """Persist a confirmed proposal into inventory + habits, then run first grocery run."""
+    from grocery_buddy.db import get_pool
+    from grocery_buddy.notifications import send_telegram_message
+    from grocery_buddy.tools.conversation import clear_conversation
+    from grocery_buddy.tools.consumption import upsert_consumption_profile
+    from grocery_buddy.tools.imports import set_proposal_status
+    from grocery_buddy.tools.inventory import upsert_inventory_item
+
+    pool = await get_pool()
+    saved = 0
+    for it in items:
+        try:
+            unit = it.get("unit") or "unit"
+            await upsert_inventory_item(
+                pool, user_id,
+                product=it["product"],
+                qty=float(it.get("estimated_qty") or 0),
+                unit=unit,
+                par_level=float(it.get("par_level") or 1) or 1.0,
+            )
+            rate = float(it.get("daily_rate") or 0)
+            if rate > 0:
+                await upsert_consumption_profile(
+                    pool, user_id,
+                    product=it["product"],
+                    declared_rate=rate,
+                    unit=unit,
+                    preferred_brand=it.get("preferred_brand"),
+                    brand_flexibility=it.get("brand_flexibility") or "any",
+                    notes="imported from Amazon order history",
+                )
+            saved += 1
+        except Exception as exc:
+            logger.warning("Failed to import item %r: %s", it.get("product"), exc)
+
+    await set_proposal_status(pool, proposal_id, "confirmed")
+    await clear_conversation(pool, user_id)
+
+    if saved == 0:
+        await send_telegram_message(
+            (reply + "\n\n" if reply else "")
+            + "There was nothing left to save. Tell me what's in your pantry whenever "
+            "you're ready, or say /import to try the Amazon import again."
+        )
+        return
+
+    # Show the freshly-populated pantry back so the user can confirm we captured it
+    # right (this is the "updated inventory" recap), then kick off the first run.
+    from grocery_buddy.stock import format_stock_summary, summarize_stock
+
+    recap = ""
+    try:
+        levels = await summarize_stock(pool, user_id)
+        recap = "\n\n" + format_stock_summary(levels)
+    except Exception as exc:
+        logger.warning("Post-import stock summary failed: %s", exc)
+
+    await send_telegram_message(
+        (reply + "\n\n" if reply else "")
+        + f"✅ Saved {saved} item{'s' if saved != 1 else ''} to your pantry.{recap}"
+    )
+    await send_telegram_message("Now let me take a first look at what you might need…")
+    await _start_grocery_run(user_id, trigger="onboarding")
+
+
+async def _apply_inventory_update(items: list[dict]) -> str:
+    """Apply on-the-fly on-hand quantity corrections; return a short summary line."""
+    from grocery_buddy.db import get_pool
+    from grocery_buddy.tools.inventory import set_actual_quantity
+
+    user_id = settings.grocery_buddy_user_id
+    pool = await get_pool()
+    applied: list[str] = []
+    for it in items:
+        try:
+            row = await set_actual_quantity(
+                pool, user_id, it["product"], float(it["qty"]), it.get("unit")
+            )
+            unit = (row.get("unit") or "").strip()
+            applied.append(f"{row['product']} → {float(row['qty']):g} {unit}".strip())
+        except Exception as exc:
+            logger.warning("Inventory correction failed for %r: %s", it.get("product"), exc)
+    return ", ".join(applied)
 
 
 async def _handle_briefing_reply(text: str, pending: dict) -> None:
@@ -474,7 +802,7 @@ async def _handle_briefing_reply(text: str, pending: dict) -> None:
         intent = await parse_briefing_reply(text, cart_items)
     except Exception as exc:
         logger.error("parse_briefing_reply failed: %s", exc)
-        await send_telegram_message("Sorry, couldn't understand that — try 'yes' or 'no'.")
+        await send_telegram_message(_MSG_ERROR)
         return
 
     action = intent["action"]
@@ -488,61 +816,59 @@ async def _handle_briefing_reply(text: str, pending: dict) -> None:
         )
 
     elif action == "reject":
-        await _signal(workflow_id, "reject")
-        await send_telegram_message("❌ Skipped — nothing added this run.")
+        await _retire_pending_cart(pending)
+        await send_telegram_message(_MSG_SKIPPED)
 
-    elif action == "approve_and_add":
-        await _signal(workflow_id, "approve")
-        extras = intent.get("items", [])
-        if extras:
-            summary = ", ".join(f"{i['qty']:g}× {i['product']}" for i in extras)
-            await _start_quick_buy(extras, reason="Extra items from briefing reply")
-            await send_telegram_message(
-                f"✅ Adding the list to your Amazon cart — checkout link coming up.\n"
-                f"I'll also price {summary} and send a separate list to approve."
-            )
-        else:
-            await send_telegram_message(
-                "✅ On it — adding everything to your Amazon cart. "
-                "I'll send your checkout link in a moment."
-            )
-
-    elif action == "reject_and_buy":
-        await _signal(workflow_id, "reject")
+    elif action == "buy_items":
+        # User named specific items → build a fresh cart from exactly those and set the
+        # pending suggestion aside (one clean approval track, least friction).
         items = intent.get("items", [])
-        if items:
-            summary = ", ".join(f"{i['qty']:g}× {i['product']}" for i in items)
-            await _start_quick_buy(items, reason=intent.get("reason", "Subset from briefing"))
+        if not items:
+            # Ambiguous "buy something" — ask, and keep the suggestion in view rather
+            # than silently skipping it.
             await send_telegram_message(
-                f"❌ Skipped the suggested list.\n"
-                f"Let me price just {summary} — I'll send a list to approve."
+                "Which items should I buy?\n\n" + _render_pending_cart(pending)
             )
-        else:
-            await send_telegram_message("❌ Skipped — nothing added this run.")
+            return
+        await _retire_pending_cart(pending)
+        summary = ", ".join(f"{i['qty']:g}× {i['product']}" for i in items)
+        await _start_quick_buy(items, reason=intent.get("reason", "") or "New cart from your request")
+        await send_telegram_message(
+            f"On it — building a fresh cart with {summary}. I'll send it to look "
+            "over; nothing goes in your cart until you say so."
+        )
 
     elif action == "reject_and_restart":
         # "no, start a new grocery list" — drop this cart and rebuild from the pantry.
-        await _signal(workflow_id, "reject")
+        await _retire_pending_cart(pending)
         await send_telegram_message(
             "❌ Scrapped that list. Let me take a fresh look at what you're running low on…"
         )
         await _start_grocery_run(settings.grocery_buddy_user_id, trigger="manual")
 
-    elif action == "quick_buy":
-        # User made a fresh request while a briefing was pending — handle both
-        items = intent.get("items", [])
-        if items:
-            summary = ", ".join(f"{i['qty']:g}× {i['product']}" for i in items)
-            await _start_quick_buy(items, reason=intent.get("reason", ""))
+    elif action == "update_inventory":
+        # The user corrected real on-hand amounts ("we still have plenty of eggs").
+        summary = await _apply_inventory_update(intent.get("items", []))
+        if not summary:
+            # Nothing landed — don't scrap a good cart on a failed update; ask + re-show.
             await send_telegram_message(
-                f"On it — pricing {summary} separately. I'll send that list to approve.\n\n"
-                "You've also still got this list waiting:\n\n"
-                f"{_render_pending_cart(pending)}"
+                "I couldn't update that — mind naming the item and how much you have?\n\n"
+                + _render_pending_cart(pending)
             )
-        # leave the pending cart open — user can still approve/reject it
+            return
+        # The cart was built on stale numbers, so rebuild from the corrected pantry.
+        await _retire_pending_cart(pending)
+        await send_telegram_message(
+            f"👍 Updated your pantry: {summary}.\n"
+            "That changes things — let me take a fresh look at what you actually need…"
+        )
+        await _start_grocery_run(settings.grocery_buddy_user_id, trigger="manual")
 
     elif action == "update_schedule":
+        # Schedule change doesn't decide the cart — apply it, then keep the cart in view
+        # so it isn't silently left waiting.
         await _apply_schedule_update(intent)
+        await send_telegram_message(_render_pending_cart(pending))
 
     elif action == "chat":
         # Reground the user in the list they still need to act on.
@@ -551,7 +877,10 @@ async def _handle_briefing_reply(text: str, pending: dict) -> None:
         )
 
     else:
-        await send_telegram_message("Got it — not sure what to do with that, try 'yes' or 'no'.")
+        await send_telegram_message(
+            "Got it — reply <i>yes</i> to order this list or <i>no</i> to skip it.\n\n"
+            + _render_pending_cart(pending)
+        )
 
 
 async def _apply_schedule_update(intent: dict) -> None:
@@ -583,16 +912,45 @@ async def _apply_schedule_update(intent: dict) -> None:
         )
 
 
+async def _build_stock_snapshot(user_id: str) -> str | None:
+    """Compact plain-text pantry snapshot for the assistant (low items first).
+
+    Lets the free-text assistant answer "what am I low on?" and route "buy
+    everything low" instead of claiming it has no inventory visibility.
+    """
+    from grocery_buddy.db import get_pool
+    from grocery_buddy.predictor import LOW, MEDIUM
+    from grocery_buddy.stock import summarize_stock
+
+    try:
+        pool = await get_pool()
+        levels = await summarize_stock(pool, user_id)
+    except Exception as exc:
+        logger.warning("Stock snapshot failed: %s", exc)
+        return None
+    if not levels:
+        return "(the pantry is empty — nothing tracked yet)"
+
+    rank = {LOW: 0, MEDIUM: 1}
+    lines = []
+    for lv in sorted(levels, key=lambda x: (rank.get(x.bucket, 2), x.days_remaining)):
+        tag = {"low": "LOW", "medium": "ok", "large": "plenty"}.get(lv.bucket, lv.bucket)
+        lines.append(f"- {lv.product}: {lv.qty:g} {lv.unit} [{tag}]")
+    return "\n".join(lines)
+
+
 async def _handle_fresh_request(text: str) -> None:
     """No pending cart — treat as a fresh purchase, schedule change, or question."""
     from grocery_buddy.agents.assistant import parse_request
     from grocery_buddy.notifications import send_telegram_message
 
+    user_id = settings.grocery_buddy_user_id
     try:
-        intent = await parse_request(text)
+        stock_summary = await _build_stock_snapshot(user_id)
+        intent = await parse_request(text, stock_summary=stock_summary)
     except Exception as exc:
         logger.error("parse_request failed: %s", exc)
-        await send_telegram_message("Sorry, something went wrong — try again in a moment.")
+        await send_telegram_message(_MSG_ERROR)
         return
 
     if intent["action"] == "quick_buy":
@@ -603,6 +961,20 @@ async def _handle_fresh_request(text: str) -> None:
             await send_telegram_message(
                 f"On it — pricing {summary}. I'll send you a list to look over; "
                 "nothing goes in your cart until you say so."
+            )
+    elif intent["action"] == "start_grocery_run":
+        await _start_grocery_run(user_id, trigger="manual")
+        await send_telegram_message(
+            "🛒 On it — checking everything you're running low on and pricing it out. "
+            "I'll send a list to look over; nothing goes in your cart until you say so."
+        )
+    elif intent["action"] == "update_inventory":
+        summary = await _apply_inventory_update(intent.get("items", []))
+        if summary:
+            await send_telegram_message(f"👍 Updated your pantry: {summary}.")
+        else:
+            await send_telegram_message(
+                "I couldn't update that — mind naming the item and how much you have?"
             )
     elif intent["action"] == "update_schedule":
         await _apply_schedule_update(intent)

@@ -14,6 +14,8 @@ users
  ├── inventory_items      (1:many)
  ├── consumption_profile  (1:many)
  ├── consumption_events   (1:many)
+ ├── import_proposals     (1:many — staged order-history imports, pre-confirmation)
+ ├── conversation_state   (1:1 — Telegram chat flow state)
  └── carts                (1:many)
        ├── cart_items     (1:many)
        ├── approvals      (1:many — usually 1)
@@ -101,14 +103,18 @@ Current pantry state. One row per product per user.
 | `id` | `UUID PK` | | |
 | `user_id` | `UUID → users.id` | | |
 | `product` | `TEXT` | | Product name (free-form, e.g. `'Eggs'`) |
-| `qty` | `FLOAT` | `0` | Current quantity on hand |
+| `qty` | `FLOAT` | `0` | Current **estimated** quantity on hand. A scheduled checkup decays this by `rate × days elapsed` (see `last_estimated_at`). |
+| `actual_qty` | `FLOAT` | `NULL` | Last quantity the **user confirmed** ("we still have a dozen"). The anchor the estimate snaps back to on a correction. |
 | `unit` | `TEXT` | `'unit'` | `'dozen'`, `'lbs'`, `'oz'`, `'gallon'`, `'count'`, etc. |
 | `par_level` | `FLOAT` | `1` | Minimum comfortable qty; triggers restock if no consumption profile |
+| `last_estimated_at` | `TIMESTAMPTZ` | `NOW()` | When the estimate was last reconciled. Depletion measures elapsed time from here and only advances it when it actually decrements, so nothing is double-counted. |
 | `updated_at` | `TIMESTAMPTZ` | | |
 
 **UNIQUE on `(user_id, product)`** — upsert by product name.
 
 The predictor flags an item when: `qty / effective_daily_rate ≤ lead_time + buffer_days`. If there's no consumption profile, it falls back to `qty ≤ par_level`.
+
+**Estimated vs. actual:** `qty` is the agent's running estimate; `actual_qty` is the last user-confirmed truth. A scheduled grocery run first applies *estimated depletion* (assume the household kept consuming at its usual rate). When the user corrects an item on the fly — "we still have plenty of eggs", "the family used them all" — both `qty` and `actual_qty` snap to the stated amount and `last_estimated_at` resets to now.
 
 ---
 
@@ -149,10 +155,14 @@ Immutable audit log of every consumption/restock event.
 | `user_id` | `UUID → users.id` | |
 | `product` | `TEXT` | |
 | `delta` | `FLOAT` | **Negative = consumed** (`-1.0`), **positive = restocked** (`+12.0`) |
-| `source` | `TEXT CHECK` | `'user_update'` \| `'purchase'` \| `'inferred'` |
+| `source` | `TEXT CHECK` | `'user_update'` \| `'purchase'` \| `'inferred'` \| `'correction'` |
 | `ts` | `TIMESTAMPTZ` | When it happened |
 
-The predictor uses the last 30 days of `delta < 0` events to calculate observed consumption rate. Purchases automatically log a positive delta (restocked) via `execute_purchase_activity`.
+The predictor uses the last 30 days of `delta < 0` events **with `source = 'user_update'`** to calculate the observed consumption rate. Other sources are logged for the audit trail but deliberately excluded from the rate blend:
+- `'inferred'` — the agent's own arithmetic depletion. Counting it would let the model feed back on itself.
+- `'correction'` — a user resetting their absolute on-hand quantity. A one-off ("family came over and used them all") shouldn't permanently inflate the steady-state rate.
+
+Purchases automatically log a positive delta (restocked).
 
 ---
 
@@ -254,6 +264,23 @@ Immutable record of every executed or attempted purchase.
 
 ---
 
+### `import_proposals`
+Staged pantry proposals synthesized from a user's Amazon order history, held for review before anything is written to `inventory_items` / `consumption_profile`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `UUID PK` | |
+| `user_id` | `UUID → users.id` | |
+| `source` | `TEXT` | `'amazon_orders'` |
+| `items` | `JSONB` | Working list the user edits in review (product, unit, estimated_qty, par_level, daily_rate, preferred_brand, brand_flexibility, last_ordered, times_ordered, category) |
+| `status` | `TEXT CHECK` | `'pending_review'` \| `'confirmed'` \| `'discarded'` |
+| `created_at` | `TIMESTAMPTZ` | |
+| `updated_at` | `TIMESTAMPTZ` | |
+
+`ImportHistoryWorkflow` scrapes orders → Sonnet synthesizes the list → it's staged here and the user enters `import_review` conversation mode. Edits ("remove the unhealthy snacks") rewrite `items`; on confirm the list is persisted to the live pantry and the first grocery run starts. Nothing touches inventory until confirmation.
+
+---
+
 ## Indexes
 
 | Index | Columns | Purpose |
@@ -265,6 +292,7 @@ Immutable record of every executed or attempted purchase.
 | `idx_price_snapshots_product` | `price_snapshots(product, store_retailer, captured_at DESC)` | Future cache-first lookup |
 | `idx_cart_items_cart` | `cart_items(cart_id)` | Load all items for a cart |
 | `idx_purchases_idempotency` | `purchases(idempotency_key)` | Idempotency guard check |
+| `idx_import_proposals_user_status` | `import_proposals(user_id, status, created_at DESC)` | Find the active proposal for review |
 
 ---
 

@@ -16,9 +16,9 @@ from grocery_buddy.predictor import (
 )
 
 
-def _event(delta: float, days_ago: int) -> ConsumptionEvent:
+def _event(delta: float, days_ago: int, source: str = "user_update") -> ConsumptionEvent:
     ts = datetime.now(timezone.utc) - timedelta(days=days_ago)
-    return ConsumptionEvent(delta=delta, ts=ts)
+    return ConsumptionEvent(delta=delta, ts=ts, source=source)
 
 
 class TestEffectiveDailyRate:
@@ -52,6 +52,30 @@ class TestEffectiveDailyRate:
         # Only 1 consumption event → weight = 1/14 ≈ 0.071
         weight = min(1 / 14.0, 0.8)
         observed = 5.0 / 30
+        expected = (1 - weight) * 1.0 + weight * observed
+        assert rate == pytest.approx(expected, rel=0.01)
+
+    def test_inferred_and_correction_events_ignored(self):
+        """Only genuine user_update consumption informs the rate — not the model's
+        own arithmetic depletion ('inferred') or one-off resets ('correction')."""
+        profile = ConsumptionProfile(product="Eggs", declared_rate=1.0, unit="count")
+        events = [
+            _event(-3.0, 2, source="inferred"),    # our own depletion — must not count
+            _event(-9.0, 4, source="correction"),  # "family used them all" — must not count
+        ]
+        rate = effective_daily_rate(profile, events)
+        assert rate == pytest.approx(1.0)  # falls back to declared, untouched
+
+    def test_user_update_still_counts_alongside_ignored_sources(self):
+        profile = ConsumptionProfile(product="Eggs", declared_rate=1.0, unit="count")
+        events = [
+            _event(-5.0, 5, source="user_update"),  # real consumption — counts
+            _event(-50.0, 3, source="inferred"),    # ignored
+            _event(-50.0, 3, source="correction"),  # ignored
+        ]
+        rate = effective_daily_rate(profile, events)
+        weight = min(1 / 14.0, 0.8)
+        observed = 5.0 / 30  # only the user_update delta
         expected = (1 - weight) * 1.0 + weight * observed
         assert rate == pytest.approx(expected, rel=0.01)
 

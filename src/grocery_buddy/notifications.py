@@ -29,6 +29,59 @@ def telegram_enabled() -> bool:
     return bool(settings.telegram_bot_token and settings.telegram_chat_id)
 
 
+# Telegram rejects any message body over 4096 chars with 400 "message is too long".
+# We send rich, sometimes-long lists (a whole pantry, an import proposal), so rather
+# than letting the whole thing fail silently we split oversized text on natural
+# boundaries and send it as a sequence of messages. Leave headroom under the limit.
+TELEGRAM_MAX_CHARS = 4096
+_CHUNK_LIMIT = 3900
+
+
+def _split_for_telegram(text: str, limit: int = _CHUNK_LIMIT) -> list[str]:
+    """Split ``text`` into ``<=limit``-char chunks on line boundaries.
+
+    Each line is kept intact so balanced inline HTML (our renderers always open and
+    close a tag within one line) is never cut mid-tag. A single line longer than the
+    limit is hard-split as a last resort. Always returns at least one chunk.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        if len(line) > limit:
+            # A single monster line — flush what we have, then hard-split it.
+            if current:
+                chunks.append(current)
+                current = ""
+            for i in range(0, len(line), limit):
+                chunks.append(line[i:i + limit])
+            continue
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _button_row(buttons: list[dict]) -> dict:
+    """Build a single-row inline-keyboard reply_markup from button dicts."""
+    row = []
+    for b in buttons:
+        btn: dict = {"text": b["text"]}
+        if b.get("url"):
+            btn["url"] = b["url"]
+        elif b.get("callback_data"):
+            btn["callback_data"] = b["callback_data"]
+        row.append(btn)
+    return {"inline_keyboard": [row]}
+
+
 async def send_telegram_message(
     text: str,
     buttons: list[dict] | None = None,
@@ -40,35 +93,62 @@ async def send_telegram_message(
     Each is ``{"text": str, "callback_data": str}`` for a callback button or
     ``{"text": str, "url": str}`` for a link button. No-op when Telegram isn't
     configured.
+
+    Long messages are split into several sends (Telegram caps a message at 4096
+    chars); any buttons attach to the final chunk so they sit beneath the whole
+    message.
     """
     if not telegram_enabled():
         logger.warning("Telegram not configured — message not sent: %s", text[:80])
         return
 
-    payload: dict = {
-        "chat_id": settings.telegram_chat_id,
-        "text": text,
-        "parse_mode": parse_mode,
-    }
-    if buttons:
-        row = []
-        for b in buttons:
-            btn: dict = {"text": b["text"]}
-            if b.get("url"):
-                btn["url"] = b["url"]
-            elif b.get("callback_data"):
-                btn["callback_data"] = b["callback_data"]
-            row.append(btn)
-        payload["reply_markup"] = {"inline_keyboard": [row]}
-
+    chunks = _split_for_telegram(text)
     url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(url, json=payload)
-            if not resp.is_success:
-                logger.warning("Telegram API error %s: %s", resp.status_code, resp.text[:200])
+            for idx, chunk in enumerate(chunks):
+                payload: dict = {
+                    "chat_id": settings.telegram_chat_id,
+                    "text": chunk,
+                    "parse_mode": parse_mode,
+                }
+                if buttons and idx == len(chunks) - 1:
+                    payload["reply_markup"] = _button_row(buttons)
+                resp = await client.post(url, json=payload)
+                if not resp.is_success:
+                    logger.warning("Telegram API error %s: %s", resp.status_code, resp.text[:200])
     except Exception as exc:
         logger.warning("Telegram send failed: %s", exc)
+
+
+# The commands Telegram should autocomplete when the user types "/". Keep this in
+# sync with the routes handled in webhook.py (hidden ops commands are omitted).
+_BOT_COMMANDS = [
+    {"command": "import", "description": "Build your pantry from recent Amazon orders"},
+    {"command": "status", "description": "See your pantry, waiting list, and schedule"},
+    {"command": "start", "description": "Set up your pantry by hand"},
+    {"command": "help", "description": "What I can do"},
+]
+
+
+async def register_bot_commands() -> None:
+    """Publish the slash-command menu so commands autocomplete in Telegram.
+
+    Best-effort and idempotent — safe to call on every startup. No-op when
+    Telegram isn't configured.
+    """
+    if not telegram_enabled():
+        return
+    url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/setMyCommands"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url, json={"commands": _BOT_COMMANDS})
+            if not resp.is_success:
+                logger.warning("setMyCommands error %s: %s", resp.status_code, resp.text[:200])
+            else:
+                logger.info("Registered %d Telegram bot commands", len(_BOT_COMMANDS))
+    except Exception as exc:
+        logger.warning("setMyCommands failed: %s", exc)
 
 
 async def send_briefing(

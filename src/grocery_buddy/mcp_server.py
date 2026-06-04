@@ -21,6 +21,7 @@ from grocery_buddy.tools.consumption import (
 from grocery_buddy.tools.inventory import (
     get_inventory,
     log_consumption_event,
+    set_actual_quantity,
     upsert_inventory_item,
 )
 
@@ -63,6 +64,23 @@ async def record_consumption(
     pool = await get_pool()
     await log_consumption_event(pool, user_id, product, -abs(amount_consumed), "user_update")
     return f"Recorded -{amount_consumed} {unit} of {product}"
+
+
+@mcp.tool()
+async def correct_inventory_quantity(
+    user_id: str,
+    product: str,
+    qty: float,
+    unit: str = "",
+) -> str:
+    """Reset an item to the quantity actually on hand (e.g. after a manual recount).
+
+    Snaps the running estimate back to this confirmed amount and re-anchors when
+    depletion is measured from. Use 0 if the item is gone/used up.
+    """
+    pool = await get_pool()
+    result = await set_actual_quantity(pool, user_id, product, qty, unit or None)
+    return json.dumps(result, default=str)
 
 
 # ── Consumption profile tools ─────────────────────────────────────────────────

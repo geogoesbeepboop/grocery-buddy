@@ -7,6 +7,15 @@ from decimal import Decimal
 from uuid import UUID
 
 
+# ── Error-type sentinels (shared activity ↔ workflow, hence in this passed-through
+#    module) ─────────────────────────────────────────────────────────────────────
+
+# Raised by the order-history scrape when the saved Amazon session has expired, so
+# the import workflow can tell the user to re-run `make amazon-setup` rather than
+# emitting the generic "couldn't read your orders" message.
+AMAZON_LOGIN_REQUIRED = "amazon_login_required"
+
+
 # ── DB row mirrors ────────────────────────────────────────────────────────────
 
 
@@ -88,6 +97,12 @@ class GroceryRunInput:
     # stay quiet on no-op outcomes; user-initiated runs ("manual"/"onboarding")
     # bypass the cooldown and always report back so the user is never left hanging.
     trigger: str = "manual"
+
+
+@dataclass
+class ImportHistoryInput:
+    """Kick off an Amazon order-history import for onboarding."""
+    user_id: str
 
 
 @dataclass

@@ -1,5 +1,14 @@
 # Architecture
 
+> This file covers **why** the stack is shaped the way it is. For the exhaustive
+> **what** — every model, agentic loop, workflow, tool, data model, and decision
+> tree — see **[SYSTEM_REFERENCE.md](SYSTEM_REFERENCE.md)** (kept current).
+>
+> Two facts that supersede older descriptions below: notifications run over
+> **Telegram** (not ntfy.sh), and the agent **never places an order** — every run
+> ends at an approval gate, then stages an Amazon cart and hands back a checkout
+> link the user completes themselves (there is no auto-purchase path today).
+
 ## What grocery-buddy is
 
 A 24/7 autonomous agent that tracks your pantry, predicts what's running low, builds and prices a grocery cart, and executes the purchase — either automatically (under a configurable spend cap) or after you approve it on your phone.

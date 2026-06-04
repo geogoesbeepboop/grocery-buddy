@@ -24,11 +24,19 @@ Your goal: capture, in as few messages as you can, (a) what's in their pantry no
 (b) how fast they go through the things they buy regularly.
 
 How to run the conversation:
-- Up front, invite the user to dump their WHOLE pantry in ONE message, as a free-form
-  list. Tell them that for each item it helps to include — if they have it handy — the
-  item, how much they have on hand, how often they eat/use it, and any brand preference.
-  Make clear they can give as much or as little as they like; no need to wait for you to
-  ask category by category.
+- Your VERY FIRST message must LEAD with the Amazon-import shortcut as the recommended
+  way to start: because we can see their Amazon account, you can read their recent orders
+  and draft the whole pantry FOR them — brands, quantities, and how often they reorder —
+  so they barely type anything. Make that the headline offer (they can just say "yes" or
+  tap /import). Then, in one line, mention they can instead type their pantry by hand if
+  they prefer. Don't bury the import option below a wall of instructions.
+- If they accept the import (e.g. "yes", "import", "use my orders", "/import"), call
+  import_amazon_orders. They'll get a draft to review and fix before anything is saved.
+- If they'd rather type it out, invite them to dump their WHOLE pantry in ONE message as a
+  free-form list. Tell them that for each item it helps to include — if they have it
+  handy — the item, how much they have on hand, how often they eat/use it, and any brand
+  preference. Make clear they can give as much or as little as they like; no need to wait
+  for you to ask category by category.
 - Parse whatever they send and save EVERY item immediately with the tools. A single
   message will usually contain many items — loop through all of them and call the tools
   for each one. Never make the user repeat something they already told you.
@@ -102,6 +110,17 @@ _TOOLS: list[dict] = [
         },
     },
     {
+        "name": "import_amazon_orders",
+        "description": (
+            "Call this when the user wants you to set up their pantry from their Amazon "
+            "order history instead of (or before) typing it out — e.g. 'import from "
+            "Amazon', 'use my orders', 'yeah do that for me', or accepting the head-start "
+            "offer. This kicks off reading their recent orders and drafting a pantry they "
+            "can review. Do not also save items by hand in the same turn."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
         "name": "finish_onboarding",
         "description": (
             "Call this when the user has finished giving pantry info, says they're done, "
@@ -163,15 +182,16 @@ def _serialize_blocks(content_blocks: list) -> list[dict]:
 
 async def advance_onboarding(
     pool, user_id: str, messages: list[dict]
-) -> tuple[str, list[dict], bool]:
+) -> tuple[str, list[dict], str]:
     """Run one onboarding turn to completion (handling any tool calls).
 
     ``messages`` must already include the latest user message. Returns
-    ``(assistant_text, updated_messages, done)`` where ``done`` is True once the
-    model calls the ``finish_onboarding`` tool (the user finished, or asked to
-    wrap up / start a grocery run). A ``done`` turn is what triggers the caller to
-    kick off the first GroceryRunWorkflow. The transcript is kept JSON-serializable
-    so callers can persist it between stateless webhook calls.
+    ``(assistant_text, updated_messages, status)`` where ``status`` is:
+      • "continue"      — keep the interview going
+      • "done"          — user finished (finish_onboarding) → kick off first grocery run
+      • "import_orders" — user asked to import from Amazon → caller starts that flow
+    The transcript is kept JSON-serializable so callers can persist it between
+    stateless webhook calls.
     """
     client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
@@ -190,6 +210,7 @@ async def advance_onboarding(
         if response.stop_reason == "tool_use":
             tool_results = []
             finished = False
+            import_orders = False
             for block in response.content:
                 if getattr(block, "type", None) != "tool_use":
                     continue
@@ -201,6 +222,14 @@ async def advance_onboarding(
                         "content": "Onboarding complete — starting a grocery run now.",
                     })
                     continue
+                if block.name == "import_amazon_orders":
+                    import_orders = True
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": "Starting the Amazon order import now.",
+                    })
+                    continue
                 result = await _handle_tool(pool, user_id, block.name, block.input)
                 logger.debug("Tool %s → %s", block.name, result)
                 tool_results.append({
@@ -210,18 +239,25 @@ async def advance_onboarding(
                 })
             messages.append({"role": "user", "content": tool_results})
 
+            if import_orders:
+                text = "\n".join(
+                    b.text for b in response.content if getattr(b, "type", None) == "text"
+                )
+                return (
+                    text or "Great — let me read your recent Amazon orders…"
+                ), messages, "import_orders"
             if finished:
                 text = "\n".join(
                     b.text for b in response.content if getattr(b, "type", None) == "text"
                 )
-                return (text or "Great — that's everything I need to get started!"), messages, True
+                return (text or "Great — that's everything I need to get started!"), messages, "done"
             continue
 
         text = "\n".join(b.text for b in response.content if getattr(b, "type", None) == "text")
         # Fallback completion signal in case the model wraps up in prose instead of
         # calling finish_onboarding.
-        done = "setup complete" in text.lower()
-        return text, messages, done
+        status = "done" if "setup complete" in text.lower() else "continue"
+        return text, messages, status
 
 
 async def run_onboarding(user_id: str) -> None:
@@ -232,9 +268,20 @@ async def run_onboarding(user_id: str) -> None:
     print("\n🛒 Grocery Buddy Onboarding\n" + "─" * 40)
 
     while True:
-        text, messages, done = await advance_onboarding(pool, user_id, messages)
+        text, messages, status = await advance_onboarding(pool, user_id, messages)
         print(f"\nAssistant: {text}\n")
-        if done:
+        if status == "import_orders":
+            print(
+                "ℹ️  Amazon order import runs over the Telegram bot (it needs the durable "
+                "workflow + your live browser session). Let's continue here by hand — or "
+                "use the bot to import.\n"
+            )
+            messages.append({
+                "role": "user",
+                "content": "Let's just set it up by hand here instead.",
+            })
+            continue
+        if status == "done":
             print("✅ Onboarding complete!\n")
             break
         user_input = input("You: ").strip()

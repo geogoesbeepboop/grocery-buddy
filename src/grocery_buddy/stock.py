@@ -63,7 +63,7 @@ async def summarize_stock(
         if isinstance(ts, str):
             ts = datetime.fromisoformat(ts)
         events_by_product.setdefault(e["product"], []).append(
-            ConsumptionEvent(delta=float(e["delta"]), ts=ts)
+            ConsumptionEvent(delta=float(e["delta"]), ts=ts, source=e.get("source", "user_update"))
         )
 
     return classify_stock_levels(
@@ -97,10 +97,22 @@ def _days_str(level: StockLevel) -> str:
 
 
 def format_stock_summary(levels: list[StockLevel]) -> str:
-    """Render the full pantry grouped by bucket, most-urgent group first."""
-    if not levels:
-        return "📦 Your pantry is empty — send /start to set it up."
+    """Render the pantry grouped by bucket, most-urgent group first.
 
+    A big pantry (90+ items) is mostly well-stocked staples — listing every one
+    overflows Telegram's 4096-char limit and buries what matters. So we lead with
+    what's low and what's getting there (capped, with a "…and N more" tail), and
+    collapse the well-stocked bucket to a count.
+    """
+    if not levels:
+        return (
+            "📦 Your pantry is empty. Say <b>/import</b> to build it from your recent "
+            "Amazon orders (fastest), or <b>/start</b> to set it up by hand."
+        )
+
+    from grocery_buddy.config import settings
+
+    cap = settings.status_max_items_per_bucket
     groups: dict[str, list[StockLevel]] = {b: [] for b in _BUCKET_ORDER}
     for lv in levels:
         groups[lv.bucket].append(lv)
@@ -110,10 +122,18 @@ def format_stock_summary(levels: list[StockLevel]) -> str:
         items = groups[bucket]
         if not items:
             continue
+        # Well-stocked items are the bulk of a large pantry and the least useful to
+        # enumerate — collapse them to a count.
+        if bucket == LARGE:
+            n = len(items)
+            parts.append(f"{_BUCKET_HEADERS[LARGE]} — {n} item{'s' if n != 1 else ''}")
+            continue
+        shown = items if (not cap or len(items) <= cap) else items[:cap]
         lines = [_BUCKET_HEADERS[bucket]]
-        lines.extend(
-            f"• {lv.product} — {_qty_str(lv)}{_days_str(lv)}" for lv in items
-        )
+        lines.extend(f"• {lv.product} — {_qty_str(lv)}{_days_str(lv)}" for lv in shown)
+        hidden = len(items) - len(shown)
+        if hidden > 0:
+            lines.append(f"…and {hidden} more")
         parts.append("\n".join(lines))
 
     return "\n\n".join(parts)

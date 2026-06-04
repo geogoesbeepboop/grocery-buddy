@@ -29,6 +29,12 @@ class ConsumptionProfile:
 class ConsumptionEvent:
     delta: float  # negative = consumed, positive = restocked
     ts: datetime
+    # Only genuine 'user_update' consumption episodes inform the observed rate.
+    # 'inferred' (the agent's own arithmetic depletion) and 'correction' (a user
+    # resetting their absolute on-hand quantity, e.g. "family used them all") are
+    # state signals, not recurring-consumption signals — counting them would let
+    # the model feed back on itself or let a one-off spike corrupt the steady rate.
+    source: str = "user_update"
 
 
 @dataclass
@@ -84,7 +90,9 @@ def effective_daily_rate(
     now = datetime.now(timezone.utc)
     consumption_events = [
         e for e in recent_events
-        if (now - _as_utc(e.ts)).days <= lookback_days and e.delta < 0
+        if (now - _as_utc(e.ts)).days <= lookback_days
+        and e.delta < 0
+        and e.source == "user_update"
     ]
 
     if not consumption_events:

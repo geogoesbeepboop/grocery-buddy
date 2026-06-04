@@ -82,6 +82,17 @@ class GroceryRunWorkflow:
         workflow_id = workflow.info().workflow_id
         is_scheduled = payload.trigger == "schedule"
 
+        # ── 0. Assume consumption since we last looked ─────────────────────────
+        # Decay each item's estimated qty by (rate × days elapsed) so prediction
+        # works off the freshest estimate. The user's last confirmed actual_qty is
+        # untouched — corrections snap the estimate back to it.
+        await workflow.execute_activity(
+            "apply_estimated_depletion_activity",
+            user_id,
+            schedule_to_close_timeout=_SHORT_TIMEOUT,
+            retry_policy=_STANDARD_RETRY,
+        )
+
         # ── 1. Load user data ─────────────────────────────────────────────────
         user_data = await workflow.execute_activity(
             "load_user_data",
@@ -113,15 +124,19 @@ class GroceryRunWorkflow:
                 status="skipped", message="Already ran recently (within cooldown window)"
             )
 
-        # ── 2. Predict low items ──────────────────────────────────────────────
-        low_items = await workflow.execute_activity(
-            "predict_low_items_activity",
+        # ── 2. Pick what to buy: low items now + soonest mediums to clear free
+        #       shipping. We never run on fillers alone — if nothing's actually low,
+        #       there's no order to round out and we don't nag. ──────────────────
+        candidates = await workflow.execute_activity(
+            "select_run_candidates_activity",
             user_data,
             schedule_to_close_timeout=timedelta(minutes=1),
             retry_policy=_STANDARD_RETRY,
         )
+        must_buy = candidates.get("must_buy", [])
+        fillers = candidates.get("fillers", [])
 
-        if not low_items:
+        if not must_buy:
             workflow.logger.info("Pantry well stocked for user %s", user_id)
             if not is_scheduled:
                 await self._notify(
@@ -130,7 +145,8 @@ class GroceryRunWorkflow:
                 )
             return GroceryRunResult(status="no_items_needed", message="Pantry is well stocked")
 
-        # ── 3. Amazon price lookup (brand-aware) ──────────────────────────────
+        # ── 3. Amazon price lookup (brand-aware) — must-buys + capped fillers in
+        #       one browser session. ────────────────────────────────────────────
         brand_prefs = {
             prof["product"]: {
                 "preferred_brand": prof.get("preferred_brand"),
@@ -140,7 +156,7 @@ class GroceryRunWorkflow:
         }
         priced_items = await workflow.execute_activity(
             "lookup_amazon_prices",
-            {"user_id": user_id, "items": low_items, "brand_prefs": brand_prefs},
+            {"user_id": user_id, "items": must_buy + fillers, "brand_prefs": brand_prefs},
             schedule_to_close_timeout=_ACTIVITY_TIMEOUT,
             retry_policy=_STANDARD_RETRY,
         )
@@ -152,10 +168,36 @@ class GroceryRunWorkflow:
             )
             return GroceryRunResult(status="failed", message="Could not price any items on Amazon")
 
+        # ── 3b. Assemble the cart: keep every must-buy, add fillers only until we
+        #        clear the free-shipping minimum. ``reason`` explains any extras. ──
+        assembled = await workflow.execute_activity(
+            "assemble_run_cart_activity",
+            {
+                "priced_items": priced_items,
+                "threshold_usd": candidates.get("threshold_usd"),
+                "max_fillers": candidates.get("max_fillers"),
+            },
+            schedule_to_close_timeout=_SHORT_TIMEOUT,
+            retry_policy=_STANDARD_RETRY,
+        )
+        final_items = assembled.get("items", [])
+        run_reason = assembled.get("reason")
+
+        if not final_items:
+            # Fillers may have priced, but no must-buy did — don't ship a cart of
+            # things that aren't actually running out.
+            await self._notify(
+                "I tried to price what you're low on, but couldn't pull anything usable from "
+                "Amazon just now — might be a hiccup on their end. Try again in a few minutes?"
+            )
+            return GroceryRunResult(
+                status="failed", message="Could not price the low items on Amazon"
+            )
+
         # ── 4. Build draft cart ───────────────────────────────────────────────
         cart = await workflow.execute_activity(
             "build_draft_cart",
-            {"user_id": user_id, "priced_items": priced_items, "workflow_id": workflow_id},
+            {"user_id": user_id, "priced_items": final_items, "workflow_id": workflow_id},
             schedule_to_close_timeout=_SHORT_TIMEOUT,
             retry_policy=_STANDARD_RETRY,
         )
@@ -174,7 +216,13 @@ class GroceryRunWorkflow:
         # approve before we stage an Amazon cart + hand back a checkout link.
         await workflow.execute_activity(
             "send_approval_notification",
-            {"cart_id": cart_id, "total_usd": total_usd, "item_count": item_count, "workflow_id": workflow_id},
+            {
+                "cart_id": cart_id,
+                "total_usd": total_usd,
+                "item_count": item_count,
+                "workflow_id": workflow_id,
+                "reason": run_reason,
+            },
             schedule_to_close_timeout=_SHORT_TIMEOUT,
             retry_policy=_STANDARD_RETRY,
         )

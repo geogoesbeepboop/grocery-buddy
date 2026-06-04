@@ -7,7 +7,9 @@ Two entry points:
 
   parse_briefing_reply(message, cart_items)
       Reply in the context of a pending grocery cart (the morning briefing).
-      Returns approve | reject | approve_and_add | reject_and_buy | chat.
+      Returns approve | buy_items | reject | reject_and_restart | update_inventory |
+      update_schedule | chat. Guiding rule: naming items → a new cart (buy_items);
+      only an explicit approval checks out the pending suggestion.
 
 Both are channel-agnostic: the CLI `ask` command and the Telegram webhook both
 call these. The Telegram /telegram route passes cart context when a pending cart
@@ -22,6 +24,19 @@ import anthropic
 from grocery_buddy.config import settings
 
 logger = logging.getLogger(__name__)
+
+# ── Shared voice ───────────────────────────────────────────────────────────────
+# One persona snippet so every Claude-authored message sounds like the same
+# assistant, and the "don't interrogate / HTML-only" rules live in exactly one
+# place instead of drifting across prompts.
+PERSONA = (
+    "You are Grocery Buddy — a warm, concise assistant that quietly keeps up with the "
+    "user's pantry and makes reordering effortless. Talk like a helpful friend, not a "
+    "form. Never interrogate the user for a quantity or brand they didn't give — "
+    "default quantity to 1; they can tweak anything at the approval step before "
+    "anything is bought. Keep replies short. Telegram HTML only (<b>, <i>); no "
+    "markdown, no code blocks."
+)
 
 # ── Shared tool schemas ────────────────────────────────────────────────────────
 
@@ -45,6 +60,64 @@ _ITEM_SCHEMA = {
     },
     "required": ["product"],
 }
+
+# ── Pantry-correction tool (shared between fresh and briefing-reply contexts) ──
+
+_UPDATE_INVENTORY_TOOL: dict = {
+    "name": "update_pantry_quantity",
+    "description": (
+        "Correct how much of one or more pantry items the user CURRENTLY has on hand. "
+        "Use this whenever the user tells you their real quantity rather than asking to "
+        "buy — e.g. 'we still have a full dozen eggs', 'I've only got about 2 eggs left', "
+        "'we're out of milk', 'family came over so the eggs are gone', or 'I barely "
+        "touched the coffee this week, still almost full'. This RESETS our running "
+        "estimate back to what they actually have. The user can correct several items in "
+        "one message — include every item they mention. Use qty 0 when they say something "
+        "is gone / used up / out. Do NOT use this to buy things (that's request_purchase) "
+        "— only to update on-hand amounts."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "description": "Each pantry item whose on-hand quantity the user is correcting.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "product": {"type": "string", "description": "Product name"},
+                        "qty": {
+                            "type": "number",
+                            "description": "Current quantity on hand (0 if gone/used up).",
+                        },
+                        "unit": {
+                            "type": "string",
+                            "description": "Unit if the user stated one; otherwise omit and we keep the known unit.",
+                        },
+                    },
+                    "required": ["product", "qty"],
+                },
+            },
+        },
+        "required": ["items"],
+    },
+}
+
+
+def _build_qty_items(raw_items: list[dict]) -> list[dict]:
+    """Normalize update_pantry_quantity tool items into {product, qty, unit}."""
+    out: list[dict] = []
+    for it in raw_items:
+        product = (it.get("product") or "").strip()
+        if not product:
+            continue
+        out.append({
+            "product": product,
+            "qty": float(it.get("qty") or 0),
+            "unit": (it.get("unit") or "").strip() or None,
+        })
+    return out
+
 
 # ── Schedule-update tool (shared between fresh and briefing-reply contexts) ────
 
@@ -89,11 +162,34 @@ _SCHEDULE_TOOL: dict = {
 
 # ── Fresh-request tools (no cart context) ─────────────────────────────────────
 
+_RESTOCK_TOOL: dict = {
+    "name": "restock_low_items",
+    "description": (
+        "The user wants to buy whatever is running low / restock the pantry / do a "
+        "grocery run, WITHOUT naming specific items. Use for 'buy all items running "
+        "low', 'order everything I'm low on', 'restock whatever I need', 'do a grocery "
+        "run', 'top up the pantry', 'buy what I need'. This checks the pantry's current "
+        "stock levels, builds a list of the low items, prices them on Amazon, and sends "
+        "an approval list — the user confirms before anything is bought. You DO have "
+        "access to their pantry stock; this is the tool that reads it and acts. Do NOT "
+        "claim you can't see inventory — call this instead. (If they named specific "
+        "items to buy, use request_purchase; if they're just asking what they're low on "
+        "without buying, answer from the stock summary in your context.)"
+    ),
+    "input_schema": {"type": "object", "properties": {}, "required": []},
+}
+
 _FRESH_TOOLS: list[dict] = [
     {
         "name": "request_purchase",
         "description": (
-            "Start an approval-gated purchase for items the user explicitly asked for."
+            "Buy specific item(s) the user named. Use this for ANY message that names a "
+            "thing to get — even a bare noun or a vague amount: 'milk', 'we need paper "
+            "towels', 'grab some coffee', 'a loaf of bread', 'order more dog food', "
+            "'get Eggland's Best eggs'. A bare product name means qty 1 — just buy it, "
+            "don't ask how much or which brand. Put any brand they named in that item's "
+            "preferred_brand. (If they didn't name items but want to restock whatever's "
+            "low, use restock_low_items instead.)"
         ),
         "input_schema": {
             "type": "object",
@@ -111,6 +207,8 @@ _FRESH_TOOLS: list[dict] = [
             "required": ["items"],
         },
     },
+    _RESTOCK_TOOL,
+    _UPDATE_INVENTORY_TOOL,
     _SCHEDULE_TOOL,
 ]
 
@@ -120,8 +218,11 @@ _BRIEFING_TOOLS: list[dict] = [
     {
         "name": "approve_cart",
         "description": (
-            "The user wants to buy everything in the pending cart as-is. "
-            "Use when they say 'yes', 'ok', 'approve', 'go ahead', 'buy it all', etc."
+            "The user wants to check out the pending suggested cart as-is. Use ONLY when "
+            "they refer to that pending list — 'yes', 'ok', 'approve', 'go ahead', 'buy "
+            "it all', 'looks good', 'checkout my pending cart', 'check out my cart'. If "
+            "they instead name specific items to buy, that's buy_items (a new cart), not "
+            "this."
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
@@ -129,53 +230,34 @@ _BRIEFING_TOOLS: list[dict] = [
         "name": "reject_cart",
         "description": (
             "The user doesn't want to buy anything this run and is done. "
-            "Use when they say 'no', 'skip', 'cancel', 'not now', etc. — with NO "
-            "request to build another list. If they want a fresh list instead, use "
-            "reject_and_restart; if they name items to buy instead, use reject_and_buy."
+            "Use when they say 'no', 'skip', 'cancel', 'not now', etc. — with NO named "
+            "items and NO request to build another list. If they want a fresh suggested "
+            "list, use reject_and_restart; if they name items to buy, use buy_items."
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "reject_and_restart",
         "description": (
-            "The user wants to throw away this pending list and have you build a "
-            "brand-new one from scratch by re-checking their pantry. Use when they say "
-            "'no, start a new grocery list', 'scrap this and make a new one', 'redo my "
-            "list', 'start over', etc. Do NOT use this if they named specific items to "
-            "buy instead (that's reject_and_buy)."
+            "The user wants you to throw away this suggestion and build a brand-new "
+            "SUGGESTED list from scratch by re-checking their pantry. Use for 'redo my "
+            "list', 'start over', 'make a new one', 'scrap this and rebuild' — when they "
+            "do NOT name specific items. If they name items, that's buy_items."
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
-        "name": "approve_and_add",
+        "name": "buy_items",
         "description": (
-            "The user wants everything in the cart PLUS additional items they specified. "
-            "Use when they say 'yes and add X', 'buy it all plus Y', etc."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "extra_items": {
-                    "type": "array",
-                    "items": _ITEM_SCHEMA,
-                    "description": "Additional items to also buy",
-                },
-            },
-            "required": ["extra_items"],
-        },
-    },
-    {
-        "name": "reject_and_buy",
-        "description": (
-            "The user wants to skip the suggested cart as-is but buy specific items "
-            "instead. Use when they say 'only get the eggs', 'just the milk', 'skip "
-            "everything except X', or name a subset or different items they actually "
-            "need. ALSO use this when they want the same item(s) but priced differently — "
-            "a specific/different brand ('those eggs are the wrong brand, get Eggland's "
-            "Best instead' → item product 'eggs', preferred_brand 'Eggland's Best'), or a "
-            "cheaper option ('those eggs are too expensive, find a cheaper one' → re-buy "
-            "'eggs' with no preferred_brand so the cheapest is picked). The items can be a "
-            "subset of the cart or completely different products."
+            "The user named specific item(s) they want to buy. Build a BRAND-NEW cart "
+            "from exactly those items and set the pending suggested cart aside — naming "
+            "items means they're telling you what they want instead of acting on the "
+            "suggestion. Use for 'buy milk and eggs', 'just get the eggs', 'I need bread "
+            "and butter', 'order more coffee', and for re-buys priced differently: a "
+            "named brand ('get Eggland's Best eggs instead' → product 'eggs', "
+            "preferred_brand 'Eggland's Best') or a cheaper option ('find a cheaper one' "
+            "→ re-buy with no preferred_brand). Default qty to 1; never ask for a "
+            "quantity or brand they didn't give — they tweak at the next approval step."
         ),
         "input_schema": {
             "type": "object",
@@ -183,32 +265,14 @@ _BRIEFING_TOOLS: list[dict] = [
                 "items": {
                     "type": "array",
                     "items": _ITEM_SCHEMA,
-                    "description": "Items to actually buy instead of the pending cart",
+                    "description": "Items to put in the new cart",
                 },
-                "reason": {
-                    "type": "string",
-                    "description": "Brief reason (optional)",
-                },
+                "reason": {"type": "string", "description": "Brief reason (optional)"},
             },
             "required": ["items"],
         },
     },
-    {
-        "name": "request_purchase",
-        "description": (
-            "The user is making a completely NEW purchase request unrelated to the "
-            "pending cart (they want something in addition to or instead of the briefing). "
-            "Only use this if their message is clearly NOT a response to the pending cart."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "items": {"type": "array", "items": _ITEM_SCHEMA},
-                "reason": {"type": "string"},
-            },
-            "required": ["items"],
-        },
-    },
+    _UPDATE_INVENTORY_TOOL,
     _SCHEDULE_TOOL,
 ]
 
@@ -274,17 +338,20 @@ async def compose_briefing(
     facts = "\n".join(_render_briefing_lines(items))
     context = f"Context for this run: {reason}\n" if reason else ""
     system = (
-        "You are Grocery Buddy texting a user their grocery list for approval. "
-        "Write a short, warm, natural message — like a helpful friend, not a receipt.\n\n"
+        f"{PERSONA}\n\n"
+        "You're texting the user their grocery list for approval — warm and natural, like "
+        "a friend, not a receipt.\n\n"
         "Hard rules:\n"
         "• Use the EXACT items and prices given. Don't invent, drop, or re-price anything.\n"
         "• Show each item with its brand/variant (the names already include them) and its price.\n"
         "• State the exact total.\n"
+        "• If the context note explains why extra items were added (e.g. to reach a "
+        "free-shipping minimum), work that reasoning in naturally so the added items "
+        "don't look random — but keep it to a sentence.\n"
         "• End by asking if it looks good, and make clear that if they approve you'll add "
         "everything to their Amazon cart and send a checkout link — you NEVER buy on their "
         "behalf, they finish checkout themselves.\n"
-        "• Invite quick tweaks (swap a brand, drop one, add something).\n"
-        "• Telegram HTML only: <b>, <i>. No markdown, no code blocks. Keep it tight."
+        "• Invite quick tweaks (swap a brand, drop one, add something)."
     )
     user = (
         f"{context}"
@@ -311,26 +378,44 @@ async def compose_briefing(
     return _fallback_briefing(items, total_usd, reason)
 
 
-async def parse_request(message: str) -> dict:
+async def parse_request(message: str, stock_summary: str | None = None) -> dict:
     """Interpret a free-text message with no pending-cart context.
+
+    ``stock_summary`` — optional plain-text snapshot of the user's current pantry
+    (what's low / on hand) so the assistant can answer "what am I low on?" and
+    route "buy everything low" correctly instead of claiming it can't see stock.
 
     Returns one of:
       {"action": "quick_buy", "items": [...], "reason": str}
+      {"action": "start_grocery_run"}                 # restock everything low
+      {"action": "update_inventory", "items": [{product, qty, unit}]}
       {"action": "update_schedule", "cron": str, "timezone": str, "description": str}
       {"action": "chat", "reply": str}
     """
     client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    pantry_context = (
+        f"\n\nThe user's current pantry snapshot (you CAN see this — use it to answer "
+        f"stock questions and to decide what's low):\n{stock_summary}\n"
+        if stock_summary else ""
+    )
     system = (
-        "You are Grocery Buddy's assistant. The user talks to you in plain language.\n\n"
-        "If they want to buy specific item(s) now, call request_purchase — even if "
-        "they were vague about quantity or brand. NEVER interrogate them with a "
-        "checklist of questions like 'how much?' or 'any specific type?'. If they said "
-        "'a loaf of bread', that's qty 1 — just buy it. If no quantity is given, "
-        "default to 1. They review and tweak everything (quantity, brand, swaps) at the "
-        "approval step before anything is bought, so there's no need to ask up front.\n"
-        "If they want to change when or how often the grocery briefing runs, "
-        "call update_schedule — convert what they say into a UTC cron expression.\n"
-        "Otherwise, reply conversationally. Be concise."
+        f"{PERSONA}\n\n"
+        "The user just sent a message with no grocery list pending. Route it:\n"
+        "• request_purchase — they named item(s) to buy ('milk', 'we need paper towels', "
+        "'a loaf of bread'). A bare noun = qty 1; just buy it, don't ask how much.\n"
+        "• restock_low_items — they want to restock EVERYTHING low without naming items "
+        "('buy all items running low', 'order what I need', 'do a grocery run'). You have "
+        "full access to their pantry stock (below when available); never say you can't see "
+        "their inventory.\n"
+        "• update_pantry_quantity — they're telling you how much they CURRENTLY have, not "
+        "buying ('we still have plenty of eggs', 'we're out of milk', 'the kids finished "
+        "the bread'). This corrects the estimate; it buys nothing.\n"
+        "• update_schedule — change when/how often the briefing runs (convert to a UTC "
+        "cron expression).\n"
+        "• Otherwise just reply. Answer pantry questions ('what am I low on?') from the "
+        "snapshot. If it's small talk or the intent is unclear, chat — don't trigger a "
+        "purchase or a run on a guess."
+        f"{pantry_context}"
     )
     response = await client.messages.create(
         model=settings.model_fast,
@@ -353,6 +438,14 @@ async def parse_request(message: str) -> dict:
                     "reason": args.get("reason", ""),
                 }
 
+        if block.name == "restock_low_items":
+            return {"action": "start_grocery_run"}
+
+        if block.name == "update_pantry_quantity":
+            items = _build_qty_items(args.get("items", []))
+            if items:
+                return {"action": "update_inventory", "items": items}
+
         if block.name == "update_schedule":
             return {
                 "action": "update_schedule",
@@ -371,12 +464,11 @@ async def parse_briefing_reply(message: str, cart_items: list[dict]) -> dict:
     ``cart_items`` — list of dicts with at least {product, qty, unit, price_usd}.
 
     Returns one of:
-      {"action": "approve"}
-      {"action": "reject"}
-      {"action": "reject_and_restart"}                # reject cart + rebuild from pantry
-      {"action": "approve_and_add", "items": [...]}   # approve cart + QuickBuy extras
-      {"action": "reject_and_buy", "items": [...]}    # reject cart + QuickBuy subset
-      {"action": "quick_buy", "items": [...], "reason": str}  # unrelated fresh request
+      {"action": "approve"}                           # check out the pending cart
+      {"action": "reject"}                             # skip, done
+      {"action": "reject_and_restart"}                # drop cart + rebuild suggestion
+      {"action": "buy_items", "items": [...], "reason": str}  # new cart from named items
+      {"action": "update_inventory", "items": [{product, qty, unit}]}  # correct stock + rebuild
       {"action": "chat", "reply": str}
     """
     cart_lines = "\n".join(
@@ -386,31 +478,31 @@ async def parse_briefing_reply(message: str, cart_items: list[dict]) -> dict:
     total = sum(float(it.get("price_usd") or 0) * float(it.get("qty") or 1) for it in cart_items)
 
     system = (
-        "You are Grocery Buddy's assistant. The user just received their daily grocery "
-        "briefing and replied. Interpret their reply in the context of the pending cart "
-        "shown below, and call the appropriate tool.\n\n"
+        f"{PERSONA}\n\n"
+        "The user just received their grocery briefing and replied. Interpret their reply "
+        "in the context of the pending cart shown below, and call the right tool.\n\n"
         f"Pending cart (${total:.2f} total):\n{cart_lines}\n\n"
+        "The guiding rule (least friction): if the user NAMES specific items to buy, "
+        "they want a brand-new cart of just those items — call buy_items and the pending "
+        "suggestion is set aside. Only an explicit approval of the pending list checks it "
+        "out. Don't agonize over whether they want to keep the suggestion too — naming "
+        "items always means a fresh cart.\n\n"
         "Tool guide:\n"
-        "• approve_cart — they want to buy everything\n"
-        "• reject_cart — they want to skip everything and are done\n"
-        "• reject_and_restart — they want this list scrapped and a NEW one built from "
-        "scratch ('no, start a new grocery list', 'redo it', 'start over')\n"
-        "• approve_and_add — buy the cart plus extra items they mentioned\n"
-        "• reject_and_buy — skip the suggested cart, buy only what they specified, OR "
-        "re-buy the same item priced differently (a different/specific brand, or a "
-        "cheaper option)\n"
-        "• request_purchase — a completely new/unrelated request\n\n"
-        "Critical: a 'no' that comes with ANY request to make a new list, start over, "
-        "or buy something else is NOT a plain reject_cart — honor what they asked for "
-        "(reject_and_restart or reject_and_buy). Only use reject_cart when they simply "
-        "want nothing.\n"
-        "For reject_and_buy, derive the item list from what the user said (can be a "
-        "subset of the cart or different products). If they name a brand for an item "
-        "('get Eggland's Best eggs instead'), put it in that item's preferred_brand. "
-        "If they just want it cheaper, re-buy the item with no preferred_brand. "
-        "Do not add items they didn't mention, and never ask for a quantity or brand "
-        "they didn't give — default quantity to 1 and let them tweak at the next "
-        "approval step."
+        "• approve_cart — check out the pending suggested cart ('yes', 'looks good', "
+        "'approve', 'buy it all', 'checkout my pending cart')\n"
+        "• buy_items — they named item(s) to buy → new cart from exactly those items "
+        "('buy milk and eggs', 'just get the eggs', 'get Eggland's Best eggs instead', "
+        "'find a cheaper one', 'I also need bread'). Put any named brand in that item's "
+        "preferred_brand; for a cheaper re-buy leave preferred_brand off.\n"
+        "• reject_cart — skip everything and done, with no named items ('no', 'not now')\n"
+        "• reject_and_restart — scrap this suggestion and rebuild a NEW suggested list "
+        "from the pantry, WITHOUT naming items ('redo it', 'start over')\n"
+        "• update_pantry_quantity — the user is correcting how much they ACTUALLY have, "
+        "not deciding on the cart: 'we still have plenty of eggs', 'the family used all "
+        "the bread'. This means the suggestion used stale numbers, so we fix stock and "
+        "rebuild — include every item they mention with its corrected quantity (0 if "
+        "gone). Prefer this over reject when they state a real on-hand amount.\n"
+        "• update_schedule — change when/how often the briefing runs."
     )
     client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
     response = await client.messages.create(
@@ -435,27 +527,16 @@ async def parse_briefing_reply(message: str, cart_items: list[dict]) -> dict:
         if block.name == "reject_and_restart":
             return {"action": "reject_and_restart"}
 
-        if block.name == "approve_and_add":
-            extras = [_build_item(it) for it in args.get("extra_items", []) if it.get("product")]
-            if not extras:
-                return {"action": "approve"}
-            return {"action": "approve_and_add", "items": extras}
-
-        if block.name == "reject_and_buy":
+        if block.name == "buy_items":
+            # Keep an empty list as buy_items (NOT reject) so the caller can ask which
+            # items rather than silently skipping the pending cart on an ambiguous reply.
             items = [_build_item(it) for it in args.get("items", []) if it.get("product")]
-            return (
-                {"action": "reject_and_buy", "items": items, "reason": args.get("reason", "")}
-                if items else {"action": "reject"}
-            )
+            return {"action": "buy_items", "items": items, "reason": args.get("reason", "")}
 
-        if block.name == "request_purchase":
-            items = [_build_item(it) for it in args.get("items", []) if it.get("product")]
+        if block.name == "update_pantry_quantity":
+            items = _build_qty_items(args.get("items", []))
             if items:
-                return {
-                    "action": "quick_buy",
-                    "items": items,
-                    "reason": args.get("reason", ""),
-                }
+                return {"action": "update_inventory", "items": items}
 
         if block.name == "update_schedule":
             return {

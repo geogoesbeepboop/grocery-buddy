@@ -82,8 +82,35 @@ async def _ask(user_id: str, message: str) -> None:
 
     intent = await parse_request(message)
 
+    if intent["action"] == "update_inventory":
+        from grocery_buddy.db import get_pool
+        from grocery_buddy.tools.inventory import set_actual_quantity
+
+        pool = await get_pool()
+        for it in intent.get("items", []):
+            row = await set_actual_quantity(
+                pool, user_id, it["product"], float(it["qty"]), it.get("unit")
+            )
+            click.echo(f"Updated {row['product']} → {float(row['qty']):g} {row.get('unit', '')}".rstrip())
+        return
+
+    if intent["action"] == "start_grocery_run":
+        from grocery_buddy.models import GroceryRunInput
+        from grocery_buddy.workflows.grocery_run import GroceryRunWorkflow
+
+        click.echo("Checking what you're running low on and pricing it out…")
+        client = await Client.connect(settings.temporal_host, namespace=settings.temporal_namespace)
+        handle = await client.start_workflow(
+            GroceryRunWorkflow.run,
+            GroceryRunInput(user_id=user_id, trigger="manual"),
+            id=f"grocery-run-{user_id}-{uuid.uuid4().hex[:8]}",
+            task_queue=settings.temporal_task_queue,
+        )
+        click.echo(f"Started workflow: {handle.id}")
+        return
+
     if intent["action"] != "quick_buy":
-        click.echo(intent["reply"])
+        click.echo(intent.get("reply", "Got it!"))
         return
 
     items = [QuickBuyItem(product=i["product"], qty=i["qty"], unit=i["unit"]) for i in intent["items"]]

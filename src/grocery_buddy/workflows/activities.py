@@ -1,6 +1,7 @@
 """Temporal activities — all I/O and side-effects live here (workflows stay pure)."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -11,6 +12,7 @@ from temporalio import activity
 
 from grocery_buddy.config import settings
 from grocery_buddy.db import get_pool
+from grocery_buddy.models import AMAZON_LOGIN_REQUIRED
 from grocery_buddy.notifications import (
     send_briefing,
     send_checkout_link,
@@ -44,6 +46,23 @@ async def notify_activity(payload: dict) -> None:
     message = payload.get("message", "").strip()
     if message:
         await send_telegram_message(message)
+
+
+# ── Estimated depletion (scheduled "assume they kept eating") ─────────────────
+
+
+@activity.defn
+async def apply_estimated_depletion_activity(user_id: str) -> list[dict]:
+    """Decay each item's estimated qty by assumed consumption since last reconciled.
+
+    Runs at the top of a grocery checkup so prediction sees the freshest estimate.
+    Idempotent in effect: it advances ``last_estimated_at`` only for items it
+    actually decrements, so re-runs don't double-count.
+    """
+    from grocery_buddy.depletion import apply_estimated_depletion
+
+    pool = await get_pool()
+    return await apply_estimated_depletion(pool, user_id)
 
 
 # ── T9: Data loading ──────────────────────────────────────────────────────────
@@ -95,9 +114,10 @@ async def load_user_data(user_id: str) -> dict:
 # ── T6: Prediction ────────────────────────────────────────────────────────────
 
 
-@activity.defn
-async def predict_low_items_activity(user_data: dict) -> list[dict]:
-    """Run the rule-based predictor; return list of low items."""
+def _predictor_inputs(
+    user_data: dict,
+) -> tuple[list[InventoryItem], list[ConsumptionProfile], dict[str, list[ConsumptionEvent]]]:
+    """Marshal a ``load_user_data`` dict into the predictor's dataclass inputs."""
     inventory = [
         InventoryItem(
             product=i["product"],
@@ -116,15 +136,21 @@ async def predict_low_items_activity(user_data: dict) -> list[dict]:
         )
         for p in user_data["profiles"]
     ]
-
     events_by_product: dict[str, list[ConsumptionEvent]] = {}
     for e in user_data["events"]:
         ts = e["ts"]
         if isinstance(ts, str):
             ts = datetime.fromisoformat(ts)
         events_by_product.setdefault(e["product"], []).append(
-            ConsumptionEvent(delta=float(e["delta"]), ts=ts)
+            ConsumptionEvent(delta=float(e["delta"]), ts=ts, source=e.get("source", "user_update"))
         )
+    return inventory, profiles, events_by_product
+
+
+@activity.defn
+async def predict_low_items_activity(user_data: dict) -> list[dict]:
+    """Run the rule-based predictor; return list of low items."""
+    inventory, profiles, events_by_product = _predictor_inputs(user_data)
 
     low = predict_low_items(
         inventory,
@@ -144,6 +170,56 @@ async def predict_low_items_activity(user_data: dict) -> list[dict]:
         }
         for r in low
     ]
+
+
+@activity.defn
+async def select_run_candidates_activity(user_data: dict) -> dict:
+    """Pick what to buy now + what to add to reach free shipping.
+
+    Returns ``must_buy`` (everything running LOW) and ``fillers`` (the MEDIUM items
+    due to deplete soonest, capped at ``free_shipping_max_fillers``). Each line is
+    tagged with its ``tier`` so the assembler — after pricing — can keep all
+    must-buys and pull in fillers only until the cart clears the threshold. Carries
+    the threshold/cap through so the workflow needn't read settings in the sandbox.
+    """
+    import math
+
+    from grocery_buddy.predictor import classify_stock_levels
+    from grocery_buddy.runlist import FILLER, MUST_BUY, split_run_candidates
+
+    inventory, profiles, events_by_product = _predictor_inputs(user_data)
+    levels = classify_stock_levels(
+        inventory,
+        profiles,
+        events_by_product,
+        lead_time_days=user_data.get("lead_time_days", 2.0),
+        buffer_days=user_data.get("buffer_days", 1.0),
+    )
+
+    max_fillers = int(settings.free_shipping_max_fillers)
+    must_buy, fillers = split_run_candidates(levels, max_fillers)
+
+    def _line(lv, tier: str) -> dict:
+        days = lv.days_remaining
+        # Non-finite days (no declared rate) don't survive JSON cleanly — send null
+        # and let the assembler treat it as least-urgent.
+        if days is None or math.isinf(days) or math.isnan(days):
+            days = None
+        return {
+            "product": lv.product,
+            "qty": lv.qty,
+            "unit": lv.unit,
+            "par_level": lv.par_level,
+            "days_remaining": days,
+            "tier": tier,
+        }
+
+    return {
+        "must_buy": [_line(lv, MUST_BUY) for lv in must_buy],
+        "fillers": [_line(lv, FILLER) for lv in fillers],
+        "threshold_usd": float(settings.free_shipping_threshold_usd),
+        "max_fillers": max_fillers,
+    }
 
 
 # ── T8: Amazon pricing ────────────────────────────────────────────────────────
@@ -210,6 +286,10 @@ async def lookup_amazon_prices(payload: dict) -> list[dict]:
                 # The actual Amazon listing we'd buy — this is what the user sees in
                 # the briefing (the brand/variant matters, not just "milk").
                 "notes": chosen["product"],
+                # Carried through for the free-shipping assembler: which lines are
+                # must-buys vs. fillers, and how soon each runs out.
+                "tier": item.get("tier", "must_buy"),
+                "days_remaining": item.get("days_remaining"),
             })
     finally:
         await context.close()
@@ -344,6 +424,31 @@ async def lookup_kroger_prices(payload: dict) -> list[dict]:
                 logger.warning("Kroger price lookup failed for %r: %s", item["product"], exc)
 
     return priced
+
+
+# ── Free-shipping assembly ────────────────────────────────────────────────────
+
+
+@activity.defn
+async def assemble_run_cart_activity(payload: dict) -> dict:
+    """Trim priced candidates to the final cart that clears free shipping.
+
+    Keeps every priced must-buy and adds the soonest-due fillers only until the
+    total crosses the threshold. Returns the final line-items plus a human ``reason``
+    (or None) the briefing uses to explain any added items.
+    """
+    from grocery_buddy.runlist import assemble_for_free_shipping
+
+    priced = payload["priced_items"]
+    threshold = float(payload.get("threshold_usd") or settings.free_shipping_threshold_usd)
+    max_fillers = int(payload.get("max_fillers") or settings.free_shipping_max_fillers)
+
+    final, reason = assemble_for_free_shipping(priced, threshold, max_fillers)
+    logger.info(
+        "Assembled run cart: %d of %d priced candidates (threshold $%.2f)",
+        len(final), len(priced), threshold,
+    )
+    return {"items": final, "reason": reason}
 
 
 # ── T9: Cart building ─────────────────────────────────────────────────────────
@@ -557,3 +662,201 @@ async def run_evals_activity(payload: dict) -> dict:
 
     await check_cost_alert(run_cost_usd, user_id)
     return await run_evals(user_id)
+
+
+# ── Onboarding import: re-login → scrape → synthesize → stage proposal ────────
+
+
+async def _relay_otp(user_id: str) -> str | None:
+    """Ask the user for their Amazon 2FA code over Telegram; wait for the reply.
+
+    Called from inside the login activity when Amazon prompts for a one-time code.
+    Opens a relay challenge, switches the user into ``amazon_2fa`` conversation mode
+    so the webhook routes their next message here, then polls the relay table until
+    the code arrives or we run out of time. Heartbeats so the activity isn't reaped
+    while a human is typing.
+    """
+    from grocery_buddy.tools.auth import (
+        create_otp_challenge,
+        expire_challenge,
+        read_answered_code,
+    )
+    from grocery_buddy.tools.conversation import set_conversation
+
+    pool = await get_pool()
+    challenge_id = await create_otp_challenge(pool, user_id)
+    await set_conversation(pool, user_id, "amazon_2fa", [])
+    await send_telegram_message(
+        "📲 Amazon sent you a one-time security code. Reply here with that code "
+        "(just the digits) and I'll finish signing in."
+    )
+
+    interval = 3
+    waited = 0
+    try:
+        while waited < settings.amazon_login_wait_seconds:
+            code = await read_answered_code(pool, challenge_id)
+            if code:
+                digits = "".join(c for c in code if c.isdigit())
+                return digits or None
+            await asyncio.sleep(interval)
+            waited += interval
+            activity.heartbeat()
+        return None
+    finally:
+        await expire_challenge(pool, challenge_id)
+        # Drop back to idle so a late code reply isn't misread as a command.
+        await set_conversation(pool, user_id, "idle", [])
+
+
+@activity.defn
+async def ensure_amazon_login_activity(user_id: str) -> dict:
+    """Make sure the saved Amazon session is valid, self-healing it if not.
+
+    Runs before the scrape, on the MAIN persistent profile so a successful login is
+    saved for the scraper (and later pricing/checkout) to reuse. If the session is
+    live, returns immediately. If it's expired it re-authenticates:
+
+      • credentials configured → fill them (unattended, even on scheduled runs);
+      • otherwise              → open a visible window for the user to sign in.
+
+    A 2FA prompt is relayed to the user over Telegram. Raises a non-retryable
+    login-required error if it still can't get in, so the import degrades to a clear
+    message instead of silently scraping an empty (logged-out) page.
+    """
+    from temporalio.exceptions import ApplicationError
+
+    from grocery_buddy.automation.amazon import get_browser_context, is_signed_out
+    from grocery_buddy.automation.amazon_auth import (
+        login_with_credentials,
+        wait_for_interactive_login,
+    )
+
+    email = (settings.amazon_email or "").strip()
+    password = (settings.amazon_password or "").strip()
+    have_creds = bool(email and password)
+    profile_name = (
+        (settings.amazon_profile_name or settings.amazon_account_first_name or "").strip()
+        or None
+    )
+
+    # ── 1) Probe the session with a normal browser — don't flash a visible window
+    #       just to look. Heal in place if credentials are configured. ──
+    p, context = await get_browser_context()
+    try:
+        if not await is_signed_out(context):
+            return {"status": "already_logged_in"}
+
+        if have_creds:
+            await send_telegram_message(
+                "🔐 Your Amazon session expired — signing you back in…"
+            )
+            ok = await login_with_credentials(
+                context,
+                email=email,
+                password=password,
+                get_otp=lambda: _relay_otp(user_id),
+                profile_name=profile_name,
+            )
+            if not ok:
+                raise ApplicationError(
+                    "Couldn't re-authenticate with Amazon.",
+                    type=AMAZON_LOGIN_REQUIRED,
+                    non_retryable=True,
+                )
+            logger.info("Amazon session re-authenticated for %s (credentials)", user_id)
+            return {"status": "reauthenticated"}
+    finally:
+        await context.close()
+        await p.stop()
+
+    # ── 2) No credentials → reach here only when signed out. Open a VISIBLE window
+    #       and wait for the user to sign in themselves; the import resumes after. ──
+    await send_telegram_message(
+        "🔐 Your Amazon session expired. I opened a browser window — please sign in "
+        "there and I'll pick the import back up automatically."
+    )
+    p, context = await get_browser_context(headless=False)
+    try:
+        ok = await wait_for_interactive_login(
+            context,
+            timeout_s=settings.amazon_login_wait_seconds,
+            on_tick=activity.heartbeat,
+        )
+        if not ok:
+            raise ApplicationError(
+                "Interactive Amazon login wasn't completed in time.",
+                type=AMAZON_LOGIN_REQUIRED,
+                non_retryable=True,
+            )
+        logger.info("Amazon session re-authenticated for %s (interactive)", user_id)
+        return {"status": "reauthenticated"}
+    finally:
+        await context.close()
+        await p.stop()
+
+
+@activity.defn
+async def scrape_amazon_orders_activity(user_id: str) -> list[dict]:
+    """Scrape the user's Amazon order history (Playwright). Returns raw orders.
+
+    Assumes ``ensure_amazon_login_activity`` already ran, so the session is valid.
+    Reads off the orders SEARCH listing scoped to ``AMAZON_ACCOUNT_FIRST_NAME`` (so
+    we don't import other household profiles' purchases). Uses a temp copy of the
+    auth session profile so this browser instance does not conflict with the pricing
+    browser that holds the main profile's lock.
+    """
+    import shutil
+
+    from grocery_buddy.automation.amazon import get_scraper_context, scrape_order_history
+
+    search_name = (settings.amazon_account_first_name or "").strip() or None
+    if not search_name:
+        logger.warning(
+            "AMAZON_ACCOUNT_FIRST_NAME is not set — importing the full unfiltered "
+            "order history (may include other household profiles' purchases)."
+        )
+
+    pw, context, temp_dir = await get_scraper_context()
+    try:
+        return await scrape_order_history(
+            context,
+            search_name=search_name,
+            max_pages=settings.amazon_import_max_pages,
+            max_orders=settings.amazon_import_max_orders,
+        )
+    finally:
+        await context.close()
+        await pw.stop()
+        shutil.rmtree(str(temp_dir), ignore_errors=True)
+
+
+@activity.defn
+async def synthesize_pantry_from_orders_activity(orders: list[dict]) -> list[dict]:
+    """Sonnet synthesis: raw orders → proposed grocery/household pantry items."""
+    from grocery_buddy.agents.order_history import synthesize_grocery_history
+
+    return await synthesize_grocery_history(orders)
+
+
+@activity.defn
+async def present_import_proposal_activity(payload: dict) -> dict:
+    """Stage the proposal, switch the user into import-review mode, and send it.
+
+    The actual write to inventory/consumption happens later, only if the user
+    confirms in the review conversation (handled by the webhook).
+    """
+    from grocery_buddy.agents.order_history import render_proposal
+    from grocery_buddy.tools.conversation import set_conversation
+    from grocery_buddy.tools.imports import create_import_proposal
+
+    user_id = payload["user_id"]
+    items = payload["items"]
+
+    pool = await get_pool()
+    proposal = await create_import_proposal(pool, user_id, items)
+    # Empty transcript: the proposal itself lives in the review system prompt, so
+    # the next inbound user message is the first turn of the edit conversation.
+    await set_conversation(pool, user_id, "import_review", [])
+    await send_telegram_message(render_proposal(items))
+    return {"proposal_id": proposal["id"], "item_count": len(items)}

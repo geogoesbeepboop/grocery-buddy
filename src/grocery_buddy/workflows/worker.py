@@ -10,19 +10,27 @@ from temporalio.worker import Worker
 from grocery_buddy.config import settings
 from grocery_buddy.db import close_pool
 from grocery_buddy.workflows.activities import (
+    apply_estimated_depletion_activity,
+    assemble_run_cart_activity,
     build_draft_cart,
+    ensure_amazon_login_activity,
     load_user_data,
     lookup_amazon_prices,
     lookup_kroger_prices,
     notify_activity,
     predict_low_items_activity,
     prepare_checkout_activity,
+    present_import_proposal_activity,
     run_evals_activity,
+    scrape_amazon_orders_activity,
+    select_run_candidates_activity,
     send_approval_notification,
     send_checkout_link_activity,
+    synthesize_pantry_from_orders_activity,
     update_cart_status,
 )
 from grocery_buddy.workflows.grocery_run import GroceryRunWorkflow
+from grocery_buddy.workflows.import_history import ImportHistoryWorkflow
 from grocery_buddy.workflows.quick_buy import QuickBuyWorkflow
 
 logger = logging.getLogger(__name__)
@@ -37,12 +45,15 @@ async def run_worker() -> None:
     worker = Worker(
         client,
         task_queue=settings.temporal_task_queue,
-        workflows=[GroceryRunWorkflow, QuickBuyWorkflow],
+        workflows=[GroceryRunWorkflow, QuickBuyWorkflow, ImportHistoryWorkflow],
         activities=[
+            apply_estimated_depletion_activity,
             load_user_data,
             predict_low_items_activity,
+            select_run_candidates_activity,
             lookup_amazon_prices,
             lookup_kroger_prices,
+            assemble_run_cart_activity,
             build_draft_cart,
             send_approval_notification,
             update_cart_status,
@@ -50,6 +61,10 @@ async def run_worker() -> None:
             send_checkout_link_activity,
             notify_activity,
             run_evals_activity,
+            ensure_amazon_login_activity,
+            scrape_amazon_orders_activity,
+            synthesize_pantry_from_orders_activity,
+            present_import_proposal_activity,
         ],
     )
 
