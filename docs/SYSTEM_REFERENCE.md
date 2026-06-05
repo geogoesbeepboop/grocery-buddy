@@ -116,6 +116,7 @@ sequenceDiagram
     participant DB as Postgres
     U->>W: /import
     W->>WF: start
+    WF->>AZ: ensure_amazon_login (self-heal if session expired — see below)
     WF->>AZ: scrape order-search (profile-scoped, paginated)
     AZ-->>WF: raw orders
     Note over WF: _aggregate_orders → one record per product
@@ -126,6 +127,38 @@ sequenceDiagram
     U->>W: edits / "looks good"
     W->>DB: on confirm → write inventory + consumption
     W->>U: ✅ saved + updated-pantry recap, first run starts
+```
+
+### Self-healing Amazon re-login + 2FA relay (`ensure_amazon_login_activity`)
+When the saved browser session has expired, the import re-authenticates on its own
+instead of dead-ending. With `AMAZON_EMAIL`/`AMAZON_PASSWORD` set it fills the form
+fully unattended (a verified, state-machine fill — see §10); without them it opens a
+visible window for a one-time manual sign-in. A 2FA prompt is relayed to the user
+over Telegram and back through the `amazon_auth_challenges` table.
+```mermaid
+sequenceDiagram
+    participant A as ensure_amazon_login_activity (worker)
+    participant AZ as Amazon (Playwright)
+    participant DB as amazon_auth_challenges
+    participant W as Webhook
+    participant U as User (Telegram)
+    A->>AZ: load orders page — signed out?
+    alt session still valid
+        AZ-->>A: signed in → return, scrape proceeds
+    else expired, credentials configured
+        A->>AZ: fill email + password (verified), submit
+        opt Amazon asks for a 2FA code
+            A->>DB: open 'pending' challenge, set mode = amazon_2fa
+            A->>U: 📲 reply with your one-time code
+            U->>W: 123456
+            W->>DB: write code → 'answered'
+            A->>DB: poll → consume code
+            A->>AZ: submit code, finish sign-in
+        end
+    else expired, no credentials
+        A->>U: 🔐 I opened a window — sign in there
+        A->>AZ: poll until you complete login
+    end
 ```
 
 ---
@@ -220,22 +253,27 @@ the `approve`/`reject` signals and the `notify_activity` reporter.
 Trigger: Temporal Schedule (cron) or manual start. `trigger ∈ {schedule, manual, onboarding}`.
 
 ```
-load_user_data
+apply_estimated_depletion_activity → decay on-hand estimates since last reconcile
+load_user_data                     → inventory, profiles, events, prefs + guardrails
   └─ guardrails (scheduled runs only): skip if a cart is already pending_approval;
      skip if another run happened within run_cooldown_minutes
-predict_low_items_activity        → low items (rule-based predictor §7)
-  └─ none low → notify "well stocked", end
-lookup_amazon_prices              → Playwright search + brand-aware selection
-  └─ [optional] lookup_kroger_prices for comparison
-build_draft_cart                  → carts + cart_items rows, stamps workflow_id
-send_approval_notification        → Telegram briefing (compose_briefing)
+select_run_candidates_activity     → must-buy (predictor §7) + fillers (soonest-due
+                                     mediums) to clear free shipping
+  └─ no must-buy → notify "well stocked", end  (never runs on fillers alone)
+lookup_amazon_prices               → Playwright search + brand-aware selection
+assemble_run_cart_activity         → keep every must-buy; add fillers only until the
+                                     free-shipping threshold is cleared; ``reason`` text
+build_draft_cart                   → carts + cart_items rows, stamps workflow_id
+send_approval_notification         → Telegram briefing (compose_briefing)
 update_cart_status → pending_approval
 wait_condition(decision, timeout = 24h)     ◄── approve/reject signal from webhook
-  ├─ approved → prepare_checkout_activity (stage Amazon cart, send checkout link)
-  └─ rejected/expired → update_cart_status, done
+  ├─ approved → update_cart_status(approved) → prepare_checkout_activity (stage Amazon
+  │             cart, send checkout link, NO_RETRY) → run_evals_activity
+  └─ rejected/expired → update_cart_status → run_evals_activity, done
 ```
 Note: **always requires approval** — there is no auto-purchase path (the
-`auto_purchase_cap_usd` setting is reserved for a future auto-buy tier).
+`auto_purchase_cap_usd` setting is reserved for a future auto-buy tier). A top-level
+`try/except` notifies the user on any unexpected failure so a run never ends in silence.
 
 ### 4.2 `QuickBuyWorkflow` — ad-hoc "buy X now"
 Trigger: `quick_buy` / `buy_items` actions. No guardrails (ad-hoc is never
@@ -253,6 +291,8 @@ load_user_data (for brand prefs) → lookup_amazon_prices → build_draft_cart
 Trigger: `/import`, or `import_amazon_orders` during onboarding.
 
 ```
+ensure_amazon_login_activity       → self-heal the session if expired (§10); raises a
+                                     non-retryable login-required error if it can't
 scrape_amazon_orders_activity      → Playwright scrape of order-search listing
   └─ none → notify "set up the quick way", end
 synthesize_pantry_from_orders_activity   → Sonnet proposal (§3.2)
@@ -272,17 +312,22 @@ All I/O lives here; workflows stay pure.
 | `apply_estimated_depletion_activity` | Decay on-hand estimates by assumed use since last reconcile |
 | `load_user_data` | Load inventory, profiles, events, prefs + guardrail signals |
 | `predict_low_items_activity` | Run the rule-based predictor → low items |
-| `lookup_amazon_prices` | Playwright search + brand-aware candidate selection |
-| `lookup_kroger_prices` | Kroger public Products API (price comparison) |
+| `select_run_candidates_activity` | Split into must-buy (low now) + fillers (soonest-due mediums) to clear free shipping; returns `threshold_usd`, `max_fillers` |
+| `lookup_amazon_prices` | Playwright search + brand-aware candidate selection (Haiku) |
+| `lookup_kroger_prices` | Kroger public Products API (price comparison; inert without a token) |
+| `assemble_run_cart_activity` | Trim priced candidates → final cart: every must-buy + only enough fillers to clear free shipping; returns `reason` |
 | `build_draft_cart` | Write `carts` + `cart_items`, stamp `workflow_id` |
 | `send_approval_notification` | Compose + send the briefing for approval |
 | `update_cart_status` | Flip cart status |
-| `prepare_checkout_activity` | Stage Amazon cart by ASIN, return checkout link (idempotent) |
+| `prepare_checkout_activity` | Stage Amazon cart by ASIN, mark `checkout_ready`, return checkout link (idempotent on `idempotency_key`; never purchases) |
 | `send_checkout_link_activity` | (Re)send a checkout link |
 | `run_evals_activity` | Prediction precision/recall → Langfuse; cost alert |
+| `ensure_amazon_login_activity` | Self-heal the Amazon session (credential fill or interactive window) + relay 2FA over Telegram; non-retryable login-required error on failure (§10) |
 | `scrape_amazon_orders_activity` | Scrape order history (profile-scoped search) |
 | `synthesize_pantry_from_orders_activity` | Sonnet synthesis wrapper |
 | `present_import_proposal_activity` | Stage proposal + enter review mode + send it |
+
+All 18 activities live here; the workflows themselves stay pure (no I/O).
 
 ---
 
@@ -300,6 +345,7 @@ See §3 — these are the `tools=[...]` handed to each Claude call. They are the
 | `tools/conversation.py` | `get_conversation`, `set_conversation`, `clear_conversation`, `is_first_time` |
 | `tools/imports.py` | `create_import_proposal`, `get_active_import_proposal`, `update_proposal_items`, `set_proposal_status`, `apply_edits` (pure) |
 | `tools/schedule.py` | `upsert_schedule`, `get_schedule`, `next_run_utc`, `describe_next_run`, `describe_cadence` |
+| `tools/auth.py` | 2FA relay mailbox: `create_otp_challenge`, `submit_otp_code`, `read_answered_code`, `expire_challenge` (backs the `amazon_auth_challenges` table, §10) |
 | `tools/reset.py` | `clear_user_data` (the `/clear` testing reset) |
 
 ### 5.3 MCP server tools (`mcp_server.py`) — FastMCP, for local dev with Claude Code
@@ -400,10 +446,11 @@ manual / onboarding triggers bypass both guardrails (always run, always report)
 ### 8.2 Postgres tables (migrations) — see [DATABASE.md](DATABASE.md)
 `users`, `inventory_items`, `consumption_profile`, `consumption_events`,
 `preferences`, `carts`, `cart_items`, `purchases`, `approvals`, `price_snapshots`,
-`schedules`, `amazon_profiles`, `conversation_state`, `import_proposals`.
+`schedules`, `amazon_profiles`, `conversation_state`, `import_proposals`,
+`amazon_auth_challenges` (15 tables, migrations `001`–`008`).
 
 Conversation modes (`conversation_state.mode`): `idle`, `onboarding`,
-`import_review`.
+`import_review`, `amazon_2fa` (set while relaying a one-time code, §10).
 Cart statuses: `draft → pending_approval → {checkout_ready | rejected | expired | failed}`.
 
 ---
@@ -414,5 +461,43 @@ Cart statuses: `draft → pending_approval → {checkout_ready | rejected | expi
 - **Inbound:** `webhook.py` `/telegram` (messages + button callbacks), `/health`.
 - **CLI** (`cli.py`): `onboard`, `worker`, `run`, `webhook`, `schedule`, `evals`,
   `mcp`, `ask` (drives `parse_request` from the terminal).
-- **Scripts:** `scripts/setup_amazon_session.py` (save login),
-  `scripts/debug_order_scrape.py` (run just the order scrape and print JSON).
+- **Scripts:** `scripts/setup_amazon_session.py` (save a login interactively),
+  `scripts/debug_order_scrape.py` (run just the order scrape and print JSON),
+  `scripts/seed_user.py` (create a user + preferences row).
+
+---
+
+## 10. Self-healing Amazon login (`automation/amazon_auth.py`, `tools/auth.py`)
+
+Amazon has no consumer ordering API, so the agent drives a persistent authenticated
+Playwright profile (`.amazon-session/`). When that session expires,
+`ensure_amazon_login_activity` re-authenticates **before** any scrape — no terminal
+command needed. Diagram in the Visual map above.
+
+**Two entry points (`amazon_auth.py`):**
+- `login_with_credentials(...)` — unattended. Drives the sign-in form as a **bounded
+  state machine**: each pass detects the live step (email / password / 2FA / passkey
+  chooser / upsell / profile gate) and acts, re-checking after every transition
+  (Amazon sequences these differently across A/B variants). Every field write is
+  **verified** — it reads the value back and retries, typing character-by-character if
+  a programmatic fill doesn't stick (Amazon's JS sometimes clears an autofilled field).
+  Bails on a clear rejection rather than resubmitting a bad password in a loop.
+- `wait_for_interactive_login(...)` — used when no credentials are configured: opens a
+  visible window and polls the signed-in state without touching the page the user types into.
+
+**Orchestration (`ensure_amazon_login_activity`):** probe the session headlessly →
+if valid, return; else if `AMAZON_EMAIL`/`AMAZON_PASSWORD` are set, fill them; on
+failure, fall through to a visible window when one can be shown (local/dev) or raise
+`AMAZON_LOGIN_REQUIRED` (non-retryable) on a headless host.
+
+**2FA relay (the cross-process channel):** the worker holds the browser open on the
+OTP page but can't read the user's authenticator. `tools/auth.py` uses the
+`amazon_auth_challenges` table as a mailbox — the activity opens a `pending` challenge
+and asks for the code over Telegram (switching the user to the `amazon_2fa`
+conversation mode); the webhook writes the reply (`submit_otp_code` → `answered`); the
+activity polls and consumes it (`read_answered_code` → `consumed`) and submits it to
+Amazon. `harden_page` installs a virtual WebAuthn authenticator first so Amazon's
+passkey prompt falls back to the password+code flow we can actually drive.
+
+**Relevant config** (`config.py`): `amazon_email`, `amazon_password`,
+`amazon_profile_name`, `amazon_headless`, `amazon_login_wait_seconds`.

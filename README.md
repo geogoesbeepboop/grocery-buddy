@@ -1,6 +1,6 @@
 # grocery-buddy
 
-24/7 autonomous grocery agent — tracks your pantry, predicts what's running low, builds an Amazon cart, and purchases automatically (under your $ cap) or sends a push notification for approval.
+24/7 autonomous grocery agent — tracks your pantry, predicts what's running low, builds and prices an Amazon cart, and sends you a Telegram briefing to approve. On approval it stages the cart and hands back a checkout link; it never places the order itself.
 
 ## Stack
 
@@ -8,10 +8,10 @@
 |---|---|
 | Runtime / AI loop | Claude (Anthropic SDK, Sonnet 4.6 / Haiku 4.5) |
 | Orchestration / durability | Temporal (self-hosted) |
-| Database | Supabase Postgres |
+| Database | Supabase Postgres (asyncpg) |
 | Observability | Langfuse |
-| Amazon automation | Playwright (persistent session) |
-| Push notifications | ntfy.sh |
+| Amazon automation | Playwright (persistent session, self-healing login) |
+| Chat & notifications | Telegram bot (sole channel) |
 | Hosting | Fly.io / Docker |
 
 ## Quick start
@@ -90,13 +90,15 @@ These four commands also autocomplete in Telegram's "/" menu (registered via `se
 ```
 cron/schedule  (or manual / "buy what I'm low on")
     └─► Temporal GroceryRunWorkflow
-            ├── load_user_data (Postgres)
-            ├── predict_low_items_activity (rule-based predictor)
-            ├── lookup_amazon_prices (Playwright)
+            ├── apply_estimated_depletion_activity (decay estimates)
+            ├── load_user_data (Postgres) + guardrails
+            ├── select_run_candidates_activity (predictor → must-buy + free-ship fillers)
+            ├── lookup_amazon_prices (Playwright, brand-aware)
+            ├── assemble_run_cart_activity (must-buys + just enough fillers)
             ├── build_draft_cart (Postgres)
             ├── send_approval_notification (Telegram briefing)   ← always approval-gated
             ├── wait_condition (durable 24h timer)  ◄── Telegram Approve/Reject
-            │                                            → webhook → Temporal signal
+            │                                            → /telegram webhook → Temporal signal
             └── [if approved] prepare_checkout_activity
                     (Playwright stages the Amazon cart, returns a checkout link —
                      the user taps "Place order"; we never buy on their behalf)
@@ -107,7 +109,7 @@ cron/schedule  (or manual / "buy what I'm low on")
 
 ## Amazon automation note
 
-Amazon has no public consumer ordering API. This agent uses Playwright with a persistent authenticated browser profile. Run `scripts/setup_amazon_session.py` once to log in interactively; subsequent runs are headless. The agent requires your explicit approval for all purchases until the automation is proven stable for your account.
+Amazon has no public consumer ordering API. This agent uses Playwright with a persistent authenticated browser profile. Run `scripts/setup_amazon_session.py` once to log in interactively; subsequent runs are headless. When the session later expires, the agent **re-logs-in on its own** — filling `AMAZON_EMAIL`/`AMAZON_PASSWORD` unattended (relaying any 2FA code to you over Telegram) or, if no credentials are set, opening a window for a one-time manual sign-in. The agent requires your explicit approval for every cart and never completes the purchase itself.
 
 ## Cost estimate (1–2 users)
 

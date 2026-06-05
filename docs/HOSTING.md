@@ -187,7 +187,7 @@ TEMPORAL_HOST=temporal-cluster.fly.dev:7233
 | Process | Why 24/7 | Where |
 |---|---|---|
 | Temporal worker | polls for workflow tasks; must be up when scheduled runs fire | Fly.io `grocery-buddy` app, `worker` process |
-| Webhook server | must be reachable 24/7 to receive ntfy approval taps | Fly.io `grocery-buddy` app, `webhook` process |
+| Webhook server | must be reachable 24/7 to receive Telegram messages + approval taps | Fly.io `grocery-buddy` app, `webhook` process |
 | Temporal server | holds all durable workflow state | Fly.io `temporal-cluster` app (shared) |
 
 The Playwright browser automation runs **inside** the worker process on-demand — no always-running browser.
@@ -207,7 +207,9 @@ flyctl secrets set \
   DATABASE_URL=postgresql://... \
   LANGFUSE_PUBLIC_KEY=pk-lf-... \
   LANGFUSE_SECRET_KEY=sk-lf-... \
-  NTFY_TOPIC=grocery-buddy-<suffix> \
+  TELEGRAM_BOT_TOKEN=<from-botfather> \
+  TELEGRAM_CHAT_ID=<your-chat-id> \
+  GROCERY_BUDDY_USER_ID=<your-user-uuid> \
   TEMPORAL_HOST=temporal-cluster.internal:7233 \
   WEBHOOK_BASE_URL=https://grocery-buddy.fly.dev
 
@@ -241,14 +243,14 @@ All other config stays the same — your `.env` points to localhost for local de
 ### Crash recovery
 - **Temporal server:** if it crashes, restart it. In-progress workflows are durable in Postgres — they resume exactly where they left off when Temporal comes back.
 - **Worker:** if it crashes, Temporal detects the heartbeat loss and re-schedules the activity to any available worker. On Fly.io, the process auto-restarts.
-- **Webhook server:** stateless; Fly.io restarts it in seconds. ntfy retries unacknowledged calls.
+- **Webhook server:** stateless; Fly.io restarts it in seconds. Telegram retries webhook delivery until it gets a 200.
 
 ### What can actually go wrong 24/7
 | Failure | Impact | Recovery |
 |---|---|---|
 | Worker crashes mid-activity | Activity retried by Temporal (unless `maximum_attempts=1`) | Automatic |
-| Webhook server down during approval tap | ntfy shows delivery failure; user re-taps | User action |
-| Amazon session expires | Price lookup fails; worker logs warning | Re-run `setup_amazon_session.py` |
+| Webhook server down during approval tap | Telegram retries delivery; tap is reprocessed when it's back | Automatic |
+| Amazon session expires | Agent self-heals (credential fill or login window) on next run/`import` | Automatic / one-time sign-in |
 | Temporal server down | Scheduled runs queue up; fire when Temporal recovers | Automatic |
 | Supabase maintenance | Activities fail; retry policy handles it | Automatic |
 
@@ -256,89 +258,74 @@ All other config stays the same — your `.env` points to localhost for local de
 - Temporal UI: check for workflows stuck in "Running" for >25h (missed approval or hung activity)
 - Langfuse: watch cost-per-run trend; set alert in `evals.py` `COST_ALERT_THRESHOLD_USD`
 - Fly.io dashboard: confirm worker + webhook processes are both `running`
-- ntfy: test push delivery weekly (trigger a manual run above the cap)
+- Telegram: send the bot a `/status` weekly to confirm the round-trip (message → webhook → reply) is healthy
 
 ---
 
-## Why Fly.io (and why ntfy alone isn't enough)
+## Why you need an always-on host (Telegram alone isn't enough)
 
 These are two different things people conflate:
 
-- **ntfy (the phone app)** is a *notification receiver*. It shows the morning
-  briefing and the Approve/Reject buttons. It is the **output/UI**, and yes — it
-  is enough for receiving pushes and tapping approve. You don't need anything
-  else for that half.
+- **Telegram** is the *interface*. It shows the morning briefing and the
+  Approve/Reject buttons, and it's where you chat with the agent in plain language.
+  It is the **input/output**, and it's enough for that half — but it does nothing on
+  its own.
 - **Fly.io (or any always-on host)** is where the *agent itself* runs — the
-  Temporal **worker** and the **webhook server**. These are long-running
-  programs that must be awake 24/7:
-    - The **worker** is what fires the 8am scheduled run, prices items, drives
-      Playwright, and waits (durably) for your approval. If it's only running on
-      your laptop, the agent stops the moment your laptop sleeps.
-    - The **webhook server** is the thing your phone's Approve tap actually calls
-      (`/approve/{workflow_id}`). ntfy → HTTP POST → webhook → signals Temporal.
-      If nothing is listening at `WEBHOOK_BASE_URL`, the tap goes nowhere.
+  Temporal **worker** and the **webhook server**. These are long-running programs
+  that must be awake 24/7:
+    - The **worker** fires the scheduled run, prices items, drives Playwright, and
+      waits (durably) for your approval. If it only runs on your laptop, the agent
+      stops the moment your laptop sleeps.
+    - The **webhook server** is what Telegram delivers your messages and button taps
+      to (`POST /telegram`). Telegram → HTTPS → webhook → signals Temporal. If
+      nothing is listening at `WEBHOOK_BASE_URL`, your taps and messages go nowhere.
 
-So: **ntfy = your phone receiving and answering. Fly.io = the brain that's always
-on.** A "Fly app" is just a deployed container — `flyctl deploy` packages this
-repo's Docker image and runs the `worker` and `webhook` processes on a small
-always-on VM. Fly is not special; it's just a cheap, simple always-on host. Any
-of these would also work: a $5 VPS (DigitalOcean/Hetzner), a Raspberry Pi at
-home, a home server, or Railway/Render. The only hard requirement is **a machine
-that never sleeps and is reachable from the internet** (for the webhook). If you
-already have an always-on box, you can skip Fly entirely.
+So: **Telegram = you receiving and answering. Fly.io = the brain that's always on.**
+A "Fly app" is just a deployed container — `flyctl deploy` packages this repo's
+Docker image and runs the `worker` and `webhook` processes on a small always-on VM.
+Fly isn't special; any always-on, internet-reachable box works: a $5 VPS
+(DigitalOcean/Hetzner), a Raspberry Pi, a home server, or Railway/Render. The only
+hard requirement is **a machine that never sleeps and is reachable from the internet**
+(for the webhook). If you already have one, you can skip Fly entirely.
 
-> For local dev you run the worker + webhook on your laptop and expose the
-> webhook with `ngrok` (see `make dev`). That's fine for testing but not 24/7.
+> For local dev you run the worker + webhook on your laptop and expose the webhook
+> with `ngrok` (see `make dev`). Fine for testing, not for 24/7.
 
 ---
 
-## Two-way conversational channel (Telegram — built)
+## The conversational channel (Telegram)
 
-The agent talks to you through **ntfy push + tappable buttons** and now also
-through a **Telegram bot** for free-text, two-way chat. You can also drive it
-locally with the CLI: `grocery-buddy ask "I need eggs early"`.
+Telegram is the **sole** notification and chat channel. The daily briefing, every
+approval prompt, free-text chat, and the 2FA-code relay all flow through one bot. You
+can also drive the agent locally with the CLI: `grocery-buddy ask "I need eggs early"`.
 
 ### How it fits together
 
 ```
-You (Telegram)  ──text──▶  POST /telegram (webhook.py)
-                              │  parse_request()  (agents/assistant.py, Haiku)
+You (Telegram)  ──text / button──▶  POST /telegram (webhook.py)
+                              │  conversation mode? → onboarding / import_review / amazon_2fa
+                              │  else → parse_request / parse_briefing_reply (assistant.py, Haiku)
                               ▼
-                         QuickBuyWorkflow ──prices brand-aware──▶ draft cart
+                  GroceryRun / QuickBuy workflow ──brand-aware pricing──▶ draft cart
                               │
-                              ▼  approval prompt (ntfy + Telegram inline buttons)
-You tap ✅/❌  ──callback──▶  /telegram (or /approve,/reject) ──signal──▶ workflow
+                              ▼  approval briefing (Telegram inline ✅/❌ buttons)
+You tap / reply  ──callback──▶  /telegram ──signal("approve"|"reject")──▶ workflow
                               ▼
-                         execute purchase
+                  prepare_checkout_activity → checkout link (you tap "Place order")
 ```
 
-- Free text like *"I need eggs earlier than expected"* → `parse_request()` →
-  starts `QuickBuyWorkflow` for just those items, always approval-gated.
-- Approval prompts are sent to **both** ntfy and Telegram (inline ✅/❌ buttons).
-  Telegram button taps carry `callback_data` like `approve:{workflow_id}` and are
-  signaled back to Temporal by the same `/telegram` route.
-- Replies like *"actually buy me the oat milk too"* route through the same
-  `parse_request()`.
+- Free text like *"I need eggs earlier than expected"* → `parse_request()` → starts a
+  `QuickBuyWorkflow` for just those items, always approval-gated.
+- Approval briefings carry inline ✅/❌ buttons; taps send `callback_data` like
+  `approve:{workflow_id}` back to the same `/telegram` route, which signals Temporal.
+- Replies like *"actually buy me the oat milk too"* or *"we still have eggs"* route
+  through the same parser — no buttons required.
 
 ### Setup
+See [SETUP.md](./SETUP.md) Step 7 (create the bot with @BotFather, set
+`TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` / `GROCERY_BUDDY_USER_ID`, register the
+webhook). Only messages from `TELEGRAM_CHAT_ID` are acted on.
 
-1. Create a bot with **@BotFather**, copy the token.
-2. DM the bot once, then read your chat id from
-   `https://api.telegram.org/bot<TOKEN>/getUpdates`.
-3. Set in `.env`: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `GROCERY_BUDDY_USER_ID`.
-4. Register the webhook (once):
-   ```bash
-   curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=$WEBHOOK_BASE_URL/telegram"
-   ```
-   `WEBHOOK_BASE_URL` must be the public URL of the webhook server (ngrok for
-   local dev; the Fly app URL in production).
-
-Only messages from `TELEGRAM_CHAT_ID` are acted on; anything else is ignored.
-
-### Still open / future
-- **Morning briefing over Telegram:** the daily run currently notifies via ntfy.
-  Sending the briefing as a Telegram message (so the "actually buy me this" reply
-  is in the same thread) is a small follow-up — wire the daily-run completion
-  notification to `send_telegram_message`.
+### Future
 - **Multi-user:** inbound chat is single-user today (`GROCERY_BUDDY_USER_ID`). A
   chat-id → user mapping table would generalize it.

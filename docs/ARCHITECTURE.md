@@ -3,121 +3,140 @@
 > This file covers **why** the stack is shaped the way it is. For the exhaustive
 > **what** — every model, agentic loop, workflow, tool, data model, and decision
 > tree — see **[SYSTEM_REFERENCE.md](SYSTEM_REFERENCE.md)** (kept current).
->
-> Two facts that supersede older descriptions below: notifications run over
-> **Telegram** (not ntfy.sh), and the agent **never places an order** — every run
-> ends at an approval gate, then stages an Amazon cart and hands back a checkout
-> link the user completes themselves (there is no auto-purchase path today).
 
 ## What grocery-buddy is
 
-A 24/7 autonomous agent that tracks your pantry, predicts what's running low, builds and prices a grocery cart, and executes the purchase — either automatically (under a configurable spend cap) or after you approve it on your phone.
+A 24/7 autonomous agent that tracks your pantry, predicts what's running low, and
+builds and prices an Amazon grocery cart. Every run ends at an **approval gate**: you
+review an itemized briefing over Telegram, and on approval the agent stages the cart
+and hands back a checkout link you complete yourself. It **never places an order** —
+there is no auto-purchase path today (`auto_purchase_cap_usd` is reserved for a future
+auto-buy tier). All notification and chat runs over **Telegram**.
 
 ## Layer map
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  RUNTIME LAYER — how one agent turn executes                    │
-│  Anthropic SDK (claude-sonnet-4-6 / claude-haiku-4-5)           │
-│  Tool use: inventory CRUD, consumption events, price lookup      │
+│  RUNTIME LAYER — how one agent turn executes                     │
+│  Anthropic SDK (claude-sonnet-4-6 / claude-haiku-4-5)            │
+│  Intent parsing, onboarding/import chat, synthesis, brand pick   │
 └─────────────────────────────────────────────────────────────────┘
-         ▲ called from activities
+         ▲ called from activities / the webhook
 ┌─────────────────────────────────────────────────────────────────┐
-│  ORCHESTRATION LAYER — durable, crash-safe, exactly-once        │
+│  ORCHESTRATION LAYER — durable, crash-safe                       │
 │  Temporal (self-hosted via Docker; Temporal Cloud later)         │
-│  Owns: scheduling, retry policies, the approval-gate timer,     │
-│        approve/reject signals, idempotent purchase execution     │
+│  Owns: per-user scheduling, retry policies, the 24h approval     │
+│        timer, approve/reject signals, idempotent checkout        │
 └─────────────────────────────────────────────────────────────────┘
          ▲ reads/writes
 ┌─────────────────────────────────────────────────────────────────┐
-│  DATA LAYER                                                     │
-│  Supabase Postgres (asyncpg for direct connection)              │
-│  13 tables: users, inventory, consumption habits, carts,        │
-│             purchases, approvals, price snapshots               │
+│  DATA LAYER                                                      │
+│  Supabase Postgres (asyncpg, direct connection)                  │
+│  15 tables: users, inventory, consumption (profile + events),    │
+│  carts, cart_items, approvals, purchases, price_snapshots,       │
+│  schedules, import_proposals, conversation_state,                │
+│  amazon_profiles, amazon_auth_challenges                         │
 └─────────────────────────────────────────────────────────────────┘
          ▲ observes
 ┌─────────────────────────────────────────────────────────────────┐
-│  OBSERVABILITY LAYER                                            │
-│  Langfuse — traces, per-run cost, prediction accuracy evals     │
+│  OBSERVABILITY LAYER                                             │
+│  Langfuse — traces, per-run cost, prediction accuracy evals      │
+└─────────────────────────────────────────────────────────────────┘
+         ▲ all chat + notifications
+┌─────────────────────────────────────────────────────────────────┐
+│  INTERFACE LAYER                                                 │
+│  Telegram bot — sole channel: briefings, approvals (inline       │
+│  ✅/❌ buttons), free-text chat, 2FA-code relay                   │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## Full workflow diagram
+## Full workflow diagram (GroceryRunWorkflow)
 
 ```
-Temporal Schedule (per user, configurable cron)
+Temporal Schedule (per user, configurable cron)  — or manual / "buy what I'm low on"
     │
     ▼
-GroceryRunWorkflow.run(user_id)
+GroceryRunWorkflow.run(user_id, trigger)
     │
-    ├─► load_user_data            reads inventory, consumption profiles,
-    │                             events, preferences from Postgres
+    ├─► apply_estimated_depletion_activity
+    │       decay each item's estimated qty by (rate × days elapsed) so prediction
+    │       works off a fresh estimate; the user's confirmed actual_qty is untouched
     │
-    ├─► predict_low_items_activity
-    │       rule-based predictor: days_left = qty / effective_daily_rate
-    │       effective_daily_rate blends declared habit (prior) with
-    │       observed consumption events (posterior, max 80% weight)
-    │       returns items where days_left ≤ lead_time + buffer
+    ├─► load_user_data            inventory, consumption profiles, events, prefs
+    │     └─ guardrails (scheduled runs only): skip if a cart is already
+    │        pending_approval, or if another run fired within run_cooldown_minutes
     │
-    ├─► lookup_amazon_prices      Playwright drives a persistent
-    │                             authenticated Amazon browser session;
-    │                             searches grocery department, extracts
-    │                             price + ASIN for each low item
+    ├─► select_run_candidates_activity
+    │       must-buy = rule-based predictor (days_left = qty / effective_daily_rate,
+    │         flagged when ≤ lead_time + buffer; rate blends declared habit with
+    │         observed events, capped weight)
+    │       fillers  = soonest-due "medium" items, to round the order up to free
+    │         shipping. No must-buy → notify "well stocked" and stop (never runs
+    │         on fillers alone).
     │
-    ├─► [optional] lookup_kroger_prices   Kroger public Products API;
-    │                                     surfaces cheaper alternative
+    ├─► lookup_amazon_prices      Playwright drives the persistent Amazon session;
+    │                             searches the grocery dept, extracts price + ASIN,
+    │                             and picks the listing by brand preference (Haiku)
     │
-    ├─► build_draft_cart          writes carts + cart_items to Postgres;
-    │                             stores Temporal workflow_id on the cart
-    │                             so the webhook can signal back
+    ├─► assemble_run_cart_activity
+    │       keep every must-buy; add fillers only until the free-shipping threshold
+    │       is cleared. `reason` explains any extras shown in the briefing.
     │
-    ├─► [if total_usd > auto_purchase_cap]
-    │       send_approval_notification
-    │           POST to ntfy.sh topic → phone push with
-    │           "✅ Approve" and "❌ Reject" action buttons
+    ├─► build_draft_cart          writes carts + cart_items; stamps the Temporal
+    │                             workflow_id on the cart so the webhook can signal back
     │
+    ├─► send_approval_notification    Telegram briefing (Haiku-composed) with inline
+    │                                 ✅ Approve / ❌ Reject buttons
     │       update_cart_status → 'pending_approval'
     │
-    │       workflow.wait_condition(decision != None, timeout=24h)
-    │           ◄──── ntfy button tap
-    │                   → POST /approve/{workflow_id} or /reject/{workflow_id}
-    │                   → FastAPI webhook server
-    │                   → Temporal client.get_workflow_handle.signal("approve")
-    │                   └─► resumes workflow from durable timer
+    │       workflow.wait_condition(decision != None, timeout=24h)   ← durable timer
+    │           ◄──── Telegram button tap (callback_data approve:{wf} / reject:{wf})
+    │                   → POST /telegram  (FastAPI webhook)
+    │                   → Temporal handle.signal("approve" | "reject")
+    │                   └─► resumes the workflow from the durable timer
     │
-    ├─► [if approved or auto-purchase]
-    │       execute_purchase_activity
-    │           idempotency guard: check purchases table for this key
-    │           Playwright: add each ASIN to cart, proceed to checkout
-    │           records purchase with idempotency_key (UNIQUE constraint)
-    │           updates cart status → 'purchased'
-    │           sends purchase confirmation push
+    ├─► [if approved]   update_cart_status → 'approved'
+    │       prepare_checkout_activity   (NO_RETRY)
+    │           Playwright adds each ASIN to the cart, marks the cart
+    │           'checkout_ready', and returns the account cart URL — the user taps
+    │           "Place order" themselves. We NEVER complete the purchase.
+    │           idempotency_key = 'purchase-{cart_id}' (UNIQUE) guards re-staging.
     │
     └─► run_evals_activity
-            precision/recall vs. purchase history → Langfuse scores
-            cost alert if run_cost_usd > $1.00 threshold
+            prediction precision/recall vs. history → Langfuse scores;
+            cost alert if run_cost_usd exceeds the threshold
 ```
+
+`QuickBuyWorkflow` (ad-hoc "buy X now") is the same shape minus prediction (items are
+given) with a tighter **6h** approval timeout. `ImportHistoryWorkflow` runs
+`ensure_amazon_login_activity` → scrape → Sonnet synthesis → staged proposal. See
+[SYSTEM_REFERENCE.md](SYSTEM_REFERENCE.md) §4.
 
 ## Component inventory
 
 | File | Responsibility |
 |---|---|
-| `workflows/grocery_run.py` | Temporal workflow definition; signal handlers (approve/reject); approval-gate timer |
-| `workflows/activities.py` | All I/O and side-effects: DB reads/writes, Playwright calls, ntfy pushes, evals |
+| `workflows/grocery_run.py` | Scheduled/manual restock workflow; approve/reject signals; 24h approval timer |
+| `workflows/quick_buy.py` | Ad-hoc "buy X now" workflow (6h approval timer) |
+| `workflows/import_history.py` | Order-history import: ensure-login → scrape → synthesize → stage proposal |
+| `workflows/activities.py` | All 18 activities — every I/O/side-effect: DB, Playwright, Telegram, evals |
 | `workflows/worker.py` | Temporal worker — registers workflows + activities, runs forever |
-| `automation/amazon.py` | Playwright Amazon automation: session management, price search, add-to-cart, checkout |
-| `agents/onboarding.py` | Anthropic SDK conversational agent: seeds inventory + consumption habits interactively |
-| `predictor.py` | Pure-Python rule-based predictor (no external deps, fully unit-tested) |
-| `tools/inventory.py` | Inventory CRUD (asyncpg); shared by MCP server and workflow activities |
-| `tools/consumption.py` | Consumption profile + events CRUD; shared by MCP server and workflow activities |
-| `mcp_server.py` | FastMCP server — exposes the same tools for interactive local development with Claude Code |
-| `notifications.py` | ntfy.sh push helper (approval, confirmation, error) |
-| `webhook.py` | FastAPI server — converts ntfy button taps into Temporal signals |
-| `evals.py` | Prediction precision/recall against purchase history; cost alert |
+| `automation/amazon.py` | Playwright Amazon automation: session, price search, add-to-cart, order-history scrape |
+| `automation/amazon_auth.py` | Self-healing sign-in: verified credential fill (state machine) + interactive fallback |
+| `agents/assistant.py` | Intent parsing (fresh request / briefing reply), briefing composition (Haiku) |
+| `agents/onboarding.py` | Conversational intake: seeds inventory + consumption habits |
+| `agents/order_history.py` | Sonnet synthesis of scraped orders + Haiku import-review edit loop |
+| `predictor.py` / `stock.py` / `depletion.py` | Pure-Python prediction, stock bucketing, estimated depletion (unit-tested) |
+| `runlist.py` / `products.py` | Candidate/filler selection for a run; product-name normalization |
+| `tools/*.py` | Async data-access modules (inventory, consumption, conversation, imports, schedule, auth, reset) shared by activities, agents, and MCP |
+| `mcp_server.py` | FastMCP server — exposes the same tools for local dev with Claude Code |
+| `notifications.py` | Telegram helper: `send_telegram_message`, `send_briefing`, `send_checkout_link` |
+| `webhook.py` | FastAPI server — `/telegram` (messages + button callbacks → Temporal signals), `/health` |
+| `evals.py` | Prediction precision/recall against history; cost alert |
 | `tracing.py` | Langfuse context manager (no-ops gracefully if unconfigured) |
 | `config.py` | Pydantic-settings; all config from `.env` |
 | `db.py` | asyncpg connection pool singleton |
-| `cli.py` | Click CLI: onboard, worker, run, webhook, schedule, evals, mcp |
+| `cli.py` | Click CLI: onboard, worker, run, ask, webhook, schedule, mcp, evals |
 
 ## Key design decisions
 
@@ -139,7 +158,14 @@ LangGraph is not used; Temporal owns orchestration.
 
 ### Why browser automation for Amazon
 
-Amazon has no public consumer ordering API. PA-API (product advertising) was deprecated in May 2026. Playwright drives a persistent authenticated browser profile (saved to `.amazon-session/`). The agent never completes a purchase without either your explicit approval or the auto-purchase cap being under your configured limit.
+Amazon has no public consumer ordering API, so Playwright drives a persistent
+authenticated browser profile (saved to `.amazon-session/`). When that session
+expires the agent **re-authenticates itself** (`automation/amazon_auth.py`): with
+`AMAZON_EMAIL`/`AMAZON_PASSWORD` set it fills the sign-in form unattended — a verified,
+state-machine fill that survives Amazon's churning multi-step auth UI — and relays any
+2FA code to you over Telegram; without credentials it opens a window for a one-time
+manual sign-in. The agent **stages** the cart and hands back a checkout link; it never
+completes a purchase on your behalf (see SYSTEM_REFERENCE §10).
 
 ### Why asyncpg (not Supabase JS client or REST API)
 

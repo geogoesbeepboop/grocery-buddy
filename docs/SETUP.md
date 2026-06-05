@@ -5,9 +5,9 @@
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
 - Docker Desktop (for local Temporal server)
-- An Amazon account with groceries enabled (Fresh or Whole Foods delivery)
+- An Amazon account with groceries available
 - A free [Langfuse account](https://cloud.langfuse.com) (optional but recommended)
-- A free [ntfy account / topic](https://ntfy.sh) + the ntfy app on your phone
+- A Telegram account + a bot you create with [@BotFather](https://t.me/BotFather) (free; this is the only notification/chat channel)
 
 ---
 
@@ -35,11 +35,12 @@ cp .env.example .env
 | `SUPABASE_URL` | Pre-filled: `https://looimknbtjhvwxbpkbyc.supabase.co` | ✅ |
 | `SUPABASE_ANON_KEY` | Pre-filled in `.env.example` | ✅ |
 | `DATABASE_URL` | Supabase dashboard → Settings → Database → Reset password → Session pooler URL | ✅ |
-| `NTFY_TOPIC` | Any unique string, e.g. `grocery-buddy-george42` | ✅ |
+| `TELEGRAM_BOT_TOKEN` | From @BotFather when you `/newbot` | ✅ |
+| `TELEGRAM_CHAT_ID` | DM your bot once, then `getUpdates` → `result[0].message.chat.id` (see Step 7) | ✅ |
+| `GROCERY_BUDDY_USER_ID` | Your user UUID from Step 4 — inbound messages are attributed to this user | ✅ |
 | `WEBHOOK_BASE_URL` | Your public webhook URL (see Step 6) | ✅ |
-| `LANGFUSE_PUBLIC_KEY` | [cloud.langfuse.com](https://cloud.langfuse.com) → Project Settings | Optional |
-| `LANGFUSE_SECRET_KEY` | Same | Optional |
-| `AUTO_PURCHASE_CAP_USD` | Default `50.0` — adjust to taste | Optional |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | [cloud.langfuse.com](https://cloud.langfuse.com) → Project Settings | Optional |
+| `AMAZON_EMAIL` / `AMAZON_PASSWORD` | Your Amazon login — lets the agent self-heal an expired session unattended (relays 2FA over Telegram). Leave blank to sign in manually in a window each time. | Optional |
 
 **DATABASE_URL format:**
 ```
@@ -89,9 +90,10 @@ AMAZON_HEADLESS=false uv run python scripts/setup_amazon_session.py
 
 ---
 
-## Step 6 — Set up the webhook (ntfy approval gate)
+## Step 6 — Start the webhook and expose it publicly
 
-The agent sends push notifications with Approve/Reject buttons. When you tap one, ntfy calls back to your webhook server. The webhook needs to be publicly reachable.
+The webhook server receives every Telegram message and button tap. Telegram's Bot
+API must be able to reach it, so it needs a public URL.
 
 **For local dev (ngrok):**
 ```bash
@@ -111,11 +113,22 @@ The webhook server runs as a service with a stable public URL — see [OPERATION
 
 ---
 
-## Step 7 — Install the ntfy app
+## Step 7 — Wire up the Telegram bot
 
-1. Install [ntfy](https://ntfy.sh) on your phone (iOS or Android, free)
-2. Subscribe to your topic: tap **+** → enter your `NTFY_TOPIC` value
-3. You'll now receive push notifications when a cart is ready for approval
+1. Message [@BotFather](https://t.me/BotFather) → `/newbot`, copy the **token** → `TELEGRAM_BOT_TOKEN`.
+2. Open a DM with your new bot and send it any message.
+3. Read your chat id and set `TELEGRAM_CHAT_ID`:
+   ```bash
+   curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getUpdates"
+   # → result[0].message.chat.id
+   ```
+4. Register the webhook so Telegram delivers messages to your server (run once, after Step 6):
+   ```bash
+   curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook?url=$WEBHOOK_BASE_URL/telegram"
+   ```
+
+Only messages from `TELEGRAM_CHAT_ID` are acted on. You'll now get the approval
+briefing (with inline ✅/❌ buttons) and can chat with the agent in plain language.
 
 ---
 
@@ -147,7 +160,7 @@ This connects to your local Temporal server and starts processing workflows.
 uv run grocery-buddy run --user-id <your-uuid>
 ```
 
-Watch the Temporal UI at [localhost:8088](http://localhost:8088) to see the workflow progress. Check your phone — if the cart total exceeds your cap you'll get an approval push.
+Watch the Temporal UI at [localhost:8088](http://localhost:8088) to see the workflow progress. Check Telegram — you'll get an itemized briefing with ✅/❌ buttons to approve. (Tip: once onboarded, send `/import` in Telegram to bootstrap your pantry from your Amazon order history instead of entering it by hand.)
 
 ---
 
@@ -168,18 +181,18 @@ The cron expression is in **UTC**. Common values:
 
 After a successful run you should see:
 
-- A new row in `carts` with `status = 'purchased'` (or `'pending_approval'`)
+- A new row in `carts` — `status = 'pending_approval'` while awaiting your tap, then
+  `'checkout_ready'` once you approve (the agent never reaches `'purchased'` — you
+  complete checkout on Amazon yourself)
 - Rows in `cart_items` with Amazon prices and ASINs
-- A row in `purchases` with `status = 'completed'` and a non-null `idempotency_key`
+- A Telegram briefing with ✅/❌ buttons, then a checkout link after approval
 - A Langfuse trace (if configured) with per-run cost
-- A confirmation push on your phone
 
 ```sql
 -- Quick health check
-SELECT c.status, c.total_usd, c.created_at, p.status as purchase_status
-FROM carts c
-LEFT JOIN purchases p ON p.cart_id = c.id
-WHERE c.user_id = '<your-uuid>'
-ORDER BY c.created_at DESC
+SELECT status, total_usd, created_at
+FROM carts
+WHERE user_id = '<your-uuid>'
+ORDER BY created_at DESC
 LIMIT 5;
 ```

@@ -1,8 +1,10 @@
 """GroceryRunWorkflow — the durable orchestration heart of the agent.
 
 Flow:
-  load_user_data → predict_low_items → lookup_amazon_prices
-  → build_draft_cart → [approval gate if over cap] → execute_purchase
+  apply_estimated_depletion → load_user_data → select_run_candidates
+  → lookup_amazon_prices → assemble_run_cart → build_draft_cart
+  → approval gate (always) → [if approved] prepare_checkout_activity (stage cart +
+  checkout link; never places the order) → run_evals
 
 SANDBOX RULES (Temporal Python SDK):
   - No `from __future__ import annotations` — breaks Temporal's type introspection.

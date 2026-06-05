@@ -2,26 +2,27 @@
 
 **Project:** `grocery-buddy` (Supabase, `looimknbtjhvwxbpkbyc`, us-east-1)
 **Engine:** PostgreSQL 17 via asyncpg (direct connection, session pooler)
-**Migration:** `migrations/001_initial.sql` — applied 2026-06-02
+**Migrations:** `migrations/001`–`008` (15 tables). Apply each `.sql` in order in the Supabase SQL editor.
 
 ## Entity relationship overview
 
 ```
 users
- ├── preferences          (1:1)
- ├── amazon_profiles      (1:many)
- ├── schedules            (1:many — usually 1)
- ├── inventory_items      (1:many)
- ├── consumption_profile  (1:many)
- ├── consumption_events   (1:many)
- ├── import_proposals     (1:many — staged order-history imports, pre-confirmation)
- ├── conversation_state   (1:1 — Telegram chat flow state)
- └── carts                (1:many)
-       ├── cart_items     (1:many)
-       ├── approvals      (1:many — usually 1)
-       └── purchases      (1:1)
+ ├── preferences            (1:1)
+ ├── amazon_profiles        (1:many)
+ ├── amazon_auth_challenges (1:many — 2FA-code relay mailbox, self-healing login)
+ ├── schedules              (1:many — usually 1)
+ ├── inventory_items        (1:many)
+ ├── consumption_profile    (1:many)
+ ├── consumption_events     (1:many)
+ ├── import_proposals       (1:many — staged order-history imports, pre-confirmation)
+ ├── conversation_state     (1:1 — Telegram chat flow state)
+ └── carts                  (1:many)
+       ├── cart_items       (1:many)
+       ├── approvals        (1:many — usually 1)
+       └── purchases        (1:1)
 
-price_snapshots            (no FK — global price cache)
+price_snapshots              (no FK — global price cache)
 ```
 
 ---
@@ -55,13 +56,13 @@ Per-user configuration. 1:1 with `users`.
 | `user_id` | `UUID PK → users.id` | | |
 | `default_store` | `TEXT` | `'amazon'` | `'amazon'` or `'kroger'` |
 | `dietary_notes` | `TEXT` | null | Free-form notes for future prompt use |
-| `auto_purchase_cap_usd` | `DECIMAL(10,2)` | `50.00` | Orders under this execute automatically; above requires approval |
+| `auto_purchase_cap_usd` | `DECIMAL(10,2)` | `50.00` | **Reserved** for a future auto-buy tier — not enforced today (every cart requires approval) |
 | `monthly_budget_usd` | `DECIMAL(10,2)` | null | Informational — not enforced yet |
 | `lead_time_days` | `FLOAT` | `2.0` | Days of delivery lead time to account for |
 | `buffer_days` | `FLOAT` | `1.0` | Safety buffer on top of lead time |
 | `updated_at` | `TIMESTAMPTZ` | | |
 
-`auto_purchase_cap_usd` is the single most important preference — it controls how much the agent can spend without asking.
+`lead_time_days` + `buffer_days` set how early the predictor flags an item. There is no auto-purchase path today: every run ends at an approval gate regardless of total.
 
 ---
 
@@ -202,14 +203,15 @@ One cart per grocery run. Progresses through a status state machine.
 **Cart status state machine:**
 ```
 draft
-  └─► pending_approval  (if total > auto_purchase_cap)
-        ├─► approved
-        │     └─► purchased
+  └─► pending_approval        (briefing sent — ALWAYS; there is no auto-buy path)
+        ├─► approved ─► checkout_ready   (Amazon cart staged, checkout link sent;
+        │                                 the user taps "Place order" themselves)
         ├─► rejected
-        └─► expired     (no response in 24h)
-  └─► purchased         (if total ≤ auto_purchase_cap — skips approval)
-  └─► failed            (any unrecoverable error)
+        └─► expired           (no response in 24h for GroceryRun / 6h for QuickBuy)
+  └─► failed                  (any unrecoverable error)
 ```
+The agent never reaches a "purchased" state on its own — `checkout_ready` is the
+terminal success state, because the human completes checkout on Amazon.
 
 ---
 
@@ -238,10 +240,10 @@ Tracks the approval request and decision for carts that exceeded the cap.
 |---|---|---|
 | `id` | `UUID PK` | |
 | `cart_id` | `UUID → carts.id` | |
-| `requested_at` | `TIMESTAMPTZ` | When the ntfy push was sent |
+| `requested_at` | `TIMESTAMPTZ` | When the approval briefing was sent |
 | `decided_at` | `TIMESTAMPTZ` | When the user tapped Approve/Reject (null = pending/expired) |
 | `decision` | `TEXT CHECK` | `'approved'` \| `'rejected'` \| `'expired'` |
-| `channel` | `TEXT` | `'ntfy'` (default) |
+| `channel` | `TEXT` | `'telegram'` |
 
 ---
 
@@ -281,6 +283,46 @@ Staged pantry proposals synthesized from a user's Amazon order history, held for
 
 ---
 
+### `conversation_state`
+Per-user Telegram chat-flow state. 1:1 with `users`. Lets a free-text reply be
+interpreted in the right context (mid-onboarding, mid-import-review, relaying a 2FA
+code, or idle).
+
+| Column | Type | Notes |
+|---|---|---|
+| `user_id` | `UUID PK → users.id` | |
+| `mode` | `TEXT` | `'idle'` \| `'onboarding'` \| `'import_review'` \| `'amazon_2fa'` |
+| `messages` | `JSONB` | Rolling turn history for the active agent loop |
+| `updated_at` | `TIMESTAMPTZ` | |
+
+The webhook routes inbound free text by `mode`: `onboarding`/`import_review` continue
+their agent loop; `amazon_2fa` captures the next message as the OTP code (written to
+`amazon_auth_challenges`); `idle` falls through to fresh-request / briefing-reply parsing.
+
+---
+
+### `amazon_auth_challenges`
+Mailbox that relays an Amazon 2FA one-time code from the webhook process (which
+receives the user's Telegram reply) to the worker activity (which is holding the
+browser open on the OTP page). Added in migration `008` for the self-healing login.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `UUID PK` | |
+| `user_id` | `UUID → users.id` | |
+| `kind` | `TEXT CHECK` | `'otp'` |
+| `status` | `TEXT CHECK` | `'pending'` → `'answered'` → `'consumed'`, or `'expired'` |
+| `code` | `TEXT` | The user's reply; written when `answered`, read once on `consumed` |
+| `created_at` | `TIMESTAMPTZ` | |
+| `answered_at` | `TIMESTAMPTZ` | When the user replied |
+
+Flow: the login activity opens a `pending` challenge and asks for the code over
+Telegram; the webhook's `submit_otp_code` flips it to `answered`; the activity's
+`read_answered_code` atomically consumes it (`consumed`) and submits it to Amazon.
+A timeout or a newer challenge `expires` it. See SYSTEM_REFERENCE §10.
+
+---
+
 ## Indexes
 
 | Index | Columns | Purpose |
@@ -293,6 +335,7 @@ Staged pantry proposals synthesized from a user's Amazon order history, held for
 | `idx_cart_items_cart` | `cart_items(cart_id)` | Load all items for a cart |
 | `idx_purchases_idempotency` | `purchases(idempotency_key)` | Idempotency guard check |
 | `idx_import_proposals_user_status` | `import_proposals(user_id, status, created_at DESC)` | Find the active proposal for review |
+| `idx_amazon_auth_user_status` | `amazon_auth_challenges(user_id, status, created_at DESC)` | Find the latest pending 2FA challenge |
 
 ---
 

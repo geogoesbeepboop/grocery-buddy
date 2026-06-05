@@ -758,20 +758,28 @@ async def ensure_amazon_login_activity(user_id: str) -> dict:
                 get_otp=lambda: _relay_otp(user_id),
                 profile_name=profile_name,
             )
-            if not ok:
+            if ok:
+                logger.info("Amazon session re-authenticated for %s (credentials)", user_id)
+                return {"status": "reauthenticated"}
+
+            # Automated fill didn't complete. On a headless host there's no window to
+            # show, so surface the clear login-required error. When a window CAN be
+            # shown (local/dev), fall through to the interactive path below so the
+            # user can finish the sign-in by hand instead of staying stuck.
+            logger.warning("Automated credential login did not complete for %s", user_id)
+            if settings.amazon_headless:
                 raise ApplicationError(
                     "Couldn't re-authenticate with Amazon.",
                     type=AMAZON_LOGIN_REQUIRED,
                     non_retryable=True,
                 )
-            logger.info("Amazon session re-authenticated for %s (credentials)", user_id)
-            return {"status": "reauthenticated"}
     finally:
         await context.close()
         await p.stop()
 
-    # ── 2) No credentials → reach here only when signed out. Open a VISIBLE window
-    #       and wait for the user to sign in themselves; the import resumes after. ──
+    # ── 2) Reached when signed out and either no credentials are configured, or the
+    #       automated fill above didn't complete on a non-headless host. Open a
+    #       VISIBLE window and wait for the user to sign in; the import resumes after. ──
     await send_telegram_message(
         "🔐 Your Amazon session expired. I opened a browser window — please sign in "
         "there and I'll pick the import back up automatically."

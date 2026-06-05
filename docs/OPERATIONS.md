@@ -11,7 +11,7 @@ docker compose up
 # Terminal 2 — Temporal worker (processes workflows)
 uv run grocery-buddy worker
 
-# Terminal 3 — Webhook server (receives ntfy approve/reject taps)
+# Terminal 3 — Webhook server (receives Telegram messages + approve/reject taps)
 uv run grocery-buddy webhook --port 8080
 
 # Terminal 4 (optional) — ngrok for local webhook exposure
@@ -43,10 +43,12 @@ SET qty = 18, updated_at = NOW()
 WHERE user_id = '<uuid>' AND product = 'Eggs';
 ```
 
-### Change the auto-purchase cap
+### Tune how early it flags low items
 ```sql
-UPDATE preferences SET auto_purchase_cap_usd = 75.00 WHERE user_id = '<uuid>';
+-- Larger lead_time/buffer = the agent suggests restocking sooner.
+UPDATE preferences SET lead_time_days = 3, buffer_days = 1 WHERE user_id = '<uuid>';
 ```
+(`auto_purchase_cap_usd` exists but is not enforced — every cart requires approval.)
 
 ### Change the daily schedule
 ```bash
@@ -74,15 +76,15 @@ LIMIT 10;
 
 ## Approval flow
 
-When a cart exceeds your `auto_purchase_cap_usd`:
+Every cart goes through approval (there is no auto-buy path):
 
-1. Your phone receives a push notification with **✅ Approve** and **❌ Reject** buttons
-2. Tap one → ntfy calls `POST /approve/{workflow_id}` or `/reject/{workflow_id}` on your webhook server
-3. The webhook signals Temporal → the durable workflow resumes from its 24-hour wait
-4. If approved, Playwright adds items to your Amazon cart and proceeds to checkout
-5. You receive a confirmation push with the order reference
+1. You receive a **Telegram briefing** — itemized cart, total, and inline **✅ Approve** / **❌ Reject** buttons
+2. Tap one → Telegram delivers the callback to `POST /telegram` on your webhook server (`callback_data` is `approve:{workflow_id}` / `reject:{workflow_id}`)
+3. The webhook signals Temporal (`handle.signal("approve" | "reject")`) → the durable workflow resumes from its 24-hour wait (6h for an ad-hoc QuickBuy)
+4. If approved, `prepare_checkout_activity` stages the items in your Amazon cart, marks the cart `checkout_ready`, and sends you a **checkout link** — you tap "Place order" on Amazon yourself
+5. You can also just reply in plain language ("yes", "no", "drop the donuts", "we still have eggs") instead of tapping
 
-If you don't respond within 24 hours, the workflow marks the cart as `expired` and no purchase is made.
+If you don't respond within the window, the workflow marks the cart `expired` and nothing is staged.
 
 ---
 
@@ -137,9 +139,13 @@ flyctl secrets set \
   DATABASE_URL=postgresql://... \
   LANGFUSE_PUBLIC_KEY=pk-lf-... \
   LANGFUSE_SECRET_KEY=sk-lf-... \
-  NTFY_TOPIC=grocery-buddy-<your-suffix> \
+  TELEGRAM_BOT_TOKEN=<from-botfather> \
+  TELEGRAM_CHAT_ID=<your-chat-id> \
+  GROCERY_BUDDY_USER_ID=<your-user-uuid> \
   WEBHOOK_BASE_URL=https://<your-app>.fly.dev
 ```
+After deploy, re-register the Telegram webhook against the production URL:
+`curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook?url=https://<your-app>.fly.dev/telegram"`
 
 ### Amazon session on Fly.io
 
@@ -195,11 +201,14 @@ Update `TEMPORAL_HOST` to point to your production Temporal endpoint.
 ### "No Amazon price found" for an item
 - Amazon's grocery section UI changes; check `automation/amazon.py` selectors
 - The item name might be too specific — try a more generic product name in inventory
-- Check if your Amazon session has expired: `AMAZON_HEADLESS=false uv run python scripts/setup_amazon_session.py`
+- If the Amazon session expired, the agent self-heals on the next `/import` or run (fills `AMAZON_EMAIL`/`AMAZON_PASSWORD`, relays 2FA over Telegram). To re-seed it by hand: `AMAZON_HEADLESS=false uv run python scripts/setup_amazon_session.py`
+- 2FA relay never completed? Check the latest `amazon_auth_challenges` row for the user — a `pending` that aged out means the code wasn't replied in `AMAZON_LOGIN_WAIT_SECONDS`
 
-### Webhook not receiving signals
-- Confirm `WEBHOOK_BASE_URL` is publicly reachable (ngrok / Fly.io URL)
-- Test: `curl -X POST https://your-url/approve/test-workflow-id`
+### Telegram messages / button taps not arriving
+- Confirm `WEBHOOK_BASE_URL` is publicly reachable (ngrok / Fly.io URL) and the server is up: `curl https://your-url/health`
+- Confirm the webhook is registered: `curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo"` (check `url` and `last_error_message`)
+- Re-register if needed: `curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook?url=$WEBHOOK_BASE_URL/telegram"`
+- Only messages from `TELEGRAM_CHAT_ID` are acted on — verify it matches your DM's chat id
 - Check that `workflow_id` in the `carts` table matches the running Temporal workflow
 
 ### Workflow stuck in "pending_approval"
@@ -207,10 +216,10 @@ Update `TEMPORAL_HOST` to point to your production Temporal endpoint.
 - In Temporal UI, find the workflow and check if it's waiting on `wait_condition`
 - You can manually signal it: `flyctl ssh console` → Temporal CLI or via the UI's Signal button
 
-### Purchase failed with "Failed to add X to cart"
+### Checkout staging failed with "Failed to add X to cart"
 - ASIN may have changed (Amazon updates ASINs occasionally)
 - Re-run the workflow — it will re-scrape fresh ASINs
-- The idempotency key prevents double-purchasing even if retried
+- `prepare_checkout_activity` runs with `maximum_attempts=1` (NO_RETRY) and is idempotent on `idempotency_key`, so re-staging never double-adds
 
 ### Cost spike alert fired
 - Default threshold is `$1.00/run` in `evals.py`
