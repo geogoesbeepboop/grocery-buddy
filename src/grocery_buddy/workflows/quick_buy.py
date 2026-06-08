@@ -14,12 +14,13 @@ SANDBOX RULES: see grocery_run.py — no `from __future__`, no module-level
 project imports outside the passthrough block, reference activities by string.
 """
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
+    from grocery_buddy.config import settings
     from grocery_buddy.models import GroceryRunResult, QuickBuyInput
     from grocery_buddy.products import normalize_product
 
@@ -27,6 +28,18 @@ _ACTIVITY_TIMEOUT = timedelta(minutes=10)
 _PURCHASE_TIMEOUT = timedelta(minutes=15)
 _SHORT_TIMEOUT = timedelta(minutes=2)
 _APPROVAL_WAIT = timedelta(hours=6)  # ad-hoc requests are time-sensitive
+_CONFIRM_WAIT = timedelta(hours=settings.purchase_confirm_wait_hours)
+
+
+def _parse_eta(eta_iso: str | None) -> datetime | None:
+    """Parse an ISO ETA from the record activity into an aware datetime (or None)."""
+    if not eta_iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(eta_iso)
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 _STANDARD_RETRY = RetryPolicy(
     initial_interval=timedelta(seconds=5),
@@ -43,6 +56,7 @@ class QuickBuyWorkflow:
 
     def __init__(self) -> None:
         self._decision: str | None = None
+        self._purchase_decision: str | None = None
 
     @workflow.signal
     async def approve(self) -> None:
@@ -51,6 +65,16 @@ class QuickBuyWorkflow:
     @workflow.signal
     async def reject(self) -> None:
         self._decision = "rejected"
+
+    @workflow.signal
+    async def confirm_purchase(self) -> None:
+        """The user placed the staged order — items are now on the way."""
+        self._purchase_decision = "confirmed"
+
+    @workflow.signal
+    async def mark_not_purchased(self) -> None:
+        """The user decided not to place the staged order after all."""
+        self._purchase_decision = "not_purchased"
 
     async def _notify(self, message: str) -> None:
         """Best-effort user-facing message so a request never ends in silence."""
@@ -201,7 +225,9 @@ class QuickBuyWorkflow:
                 schedule_to_close_timeout=_PURCHASE_TIMEOUT,
                 retry_policy=_NO_RETRY,
             )
-            return GroceryRunResult(status="checkout_ready", cart_id=cart_id)
+            return await self._await_purchase_confirmation(
+                user_id, cart_id, float(user_data.get("lead_time_days", 2.0))
+            )
 
         await workflow.execute_activity(
             "update_cart_status",
@@ -210,3 +236,49 @@ class QuickBuyWorkflow:
             retry_policy=_STANDARD_RETRY,
         )
         return GroceryRunResult(status=final_status, cart_id=cart_id)
+
+    async def _await_purchase_confirmation(
+        self, user_id: str, cart_id: str, lead_time_days: float
+    ) -> GroceryRunResult:
+        """Close the loop after checkout — see GroceryRunWorkflow for the rationale.
+
+        Quick-buys are the common "I need eggs early" path, so tracking them as
+        in-transit is exactly what stops the next scheduled run from re-suggesting the
+        same item.
+        """
+        try:
+            await workflow.wait_condition(
+                lambda: self._purchase_decision is not None,
+                timeout=_CONFIRM_WAIT,
+            )
+        except asyncio.TimeoutError:
+            workflow.logger.info("No purchase confirmation for quick-buy cart %s", cart_id)
+            return GroceryRunResult(status="checkout_ready", cart_id=cart_id)
+
+        if self._purchase_decision == "not_purchased":
+            await workflow.execute_activity(
+                "update_cart_status",
+                {"cart_id": cart_id, "status": "rejected"},
+                schedule_to_close_timeout=_SHORT_TIMEOUT,
+                retry_policy=_STANDARD_RETRY,
+            )
+            return GroceryRunResult(status="rejected", cart_id=cart_id)
+
+        summary = await workflow.execute_activity(
+            "record_replenishments_activity",
+            {"cart_id": cart_id, "user_id": user_id, "lead_time_days": lead_time_days},
+            schedule_to_close_timeout=_SHORT_TIMEOUT,
+            retry_policy=_STANDARD_RETRY,
+        )
+        eta = _parse_eta(summary.get("eta"))
+        if eta is not None:
+            delay = eta - workflow.now()
+            if delay > timedelta(0):
+                await workflow.sleep(delay)
+        await workflow.execute_activity(
+            "reconcile_arrivals_activity",
+            user_id,
+            schedule_to_close_timeout=_SHORT_TIMEOUT,
+            retry_policy=_STANDARD_RETRY,
+        )
+        return GroceryRunResult(status="purchased", cart_id=cart_id)

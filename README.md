@@ -1,6 +1,6 @@
 # grocery-buddy
 
-24/7 autonomous grocery agent — tracks your pantry, predicts what's running low, builds and prices an Amazon cart, and sends you a Telegram briefing to approve. On approval it stages the cart and hands back a checkout link; it never places the order itself.
+24/7 autonomous grocery agent — tracks your pantry, predicts what's running low, builds and prices an Amazon cart, and sends you a Telegram briefing to approve. On approval it stages the cart and hands back a checkout link; it never places the order itself. Once you confirm you placed the order, it tracks the delivery as **in-transit** stock (so it won't re-suggest what you just bought) and tops up your pantry when it arrives.
 
 ## Stack
 
@@ -28,7 +28,7 @@ cp .env.example .env
 docker compose up -d
 
 # 4. Apply DB migrations (after Supabase project is created)
-# Paste each migrations/*.sql file (001 → 008, in order) into the Supabase SQL editor
+# Paste each migrations/*.sql file (001 → 009, in order) into the Supabase SQL editor
 
 # 5. Save your Amazon session (run once, interactive)
 # Optional: set AMAZON_EMAIL / AMAZON_PASSWORD in .env first and the agent will
@@ -76,6 +76,8 @@ Day-to-day, you talk to the bot in plain language. A few things it understands:
 | "grab some coffee" | Ad-hoc, approval-gated order |
 | "buy what I'm low on" | Restock everything that's running low |
 | "we still have plenty of eggs, and the milk's gone" | Corrects on-hand quantities on the fly (one or many items) |
+| "ordered" / tap **✅ I placed the order** | Confirm you checked out → items tracked as on-the-way, pantry tops up on arrival |
+| "the milk never came" | Cancel an in-transit order so it counts as needed again |
 | "run my briefing at 9am daily" | Change the schedule |
 | "yes" / "no" / "buy milk and eggs" | Reply to a pending list (approve, skip, or build a fresh cart) |
 
@@ -85,23 +87,30 @@ These four commands also autocomplete in Telegram's "/" menu (registered via `se
 
 **Estimated vs. actual stock:** each scheduled checkup assumes you kept consuming at your usual rate and decays the *estimate*. When you correct an item, the estimate snaps back to what you actually have — one-off corrections never distort the long-run consumption rate.
 
+**On-hand + on-the-way:** when you confirm you placed an order, its items become *in-transit* replenishments with an estimated arrival (`ordered_at + your lead time`). Prediction counts them as covered stock, so the next run won't re-suggest eggs you just bought; when the ETA passes, a reconcile step (plus a durable per-order delivery timer) tops up your pantry and nudges you. See [docs/FEATURES_AND_ROADMAP.md](docs/FEATURES_AND_ROADMAP.md) for what's next and [docs/PROCUREMENT_CONVERGENCE.md](docs/PROCUREMENT_CONVERGENCE.md) for how this connects to the procurement-agent.
+
 ## Architecture
 
 ```
 cron/schedule  (or manual / "buy what I'm low on")
     └─► Temporal GroceryRunWorkflow
+            ├── reconcile_arrivals_activity (land in-transit orders past their ETA → restock)
             ├── apply_estimated_depletion_activity (decay estimates)
-            ├── load_user_data (Postgres) + guardrails
-            ├── select_run_candidates_activity (predictor → must-buy + free-ship fillers)
+            ├── load_user_data (Postgres, incl. in-transit "incoming") + guardrails
+            ├── select_run_candidates_activity (predictor → must-buy + free-ship fillers;
+            │                                    in-transit items count as covered stock)
             ├── lookup_amazon_prices (Playwright, brand-aware)
             ├── assemble_run_cart_activity (must-buys + just enough fillers)
             ├── build_draft_cart (Postgres)
             ├── send_approval_notification (Telegram briefing)   ← always approval-gated
             ├── wait_condition (durable 24h timer)  ◄── Telegram Approve/Reject
             │                                            → /telegram webhook → Temporal signal
-            └── [if approved] prepare_checkout_activity
-                    (Playwright stages the Amazon cart, returns a checkout link —
-                     the user taps "Place order"; we never buy on their behalf)
+            ├── [if approved] prepare_checkout_activity
+            │       (Playwright stages the Amazon cart, returns a checkout link —
+            │        the user taps "Place order"; we never buy on their behalf)
+            └── _await_purchase_confirmation  ◄── "I placed the order"
+                    (record items as in-transit → durable sleep until ETA →
+                     reconcile_arrivals tops up the pantry on delivery)
 ```
 
 **Full map of every model, agentic loop, workflow, tool, and decision tree:

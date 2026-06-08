@@ -14,6 +14,7 @@ from grocery_buddy.config import settings
 from grocery_buddy.db import get_pool
 from grocery_buddy.models import AMAZON_LOGIN_REQUIRED
 from grocery_buddy.notifications import (
+    send_arrival_notification,
     send_briefing,
     send_checkout_link,
     send_telegram_message,
@@ -65,16 +66,61 @@ async def apply_estimated_depletion_activity(user_id: str) -> list[dict]:
     return await apply_estimated_depletion(pool, user_id)
 
 
+# ── In-transit replenishments (confirm → on-the-way → restock) ────────────────
+
+
+@activity.defn
+async def record_replenishments_activity(payload: dict) -> dict:
+    """Record a confirmed order's items as in-transit (the user placed the order).
+
+    Idempotent per cart, so it's safe whether the webhook already recorded on the
+    button tap or this is the workflow's confirm signal arriving. Returns the summary
+    ``{already, eta, count, items}``.
+    """
+    from grocery_buddy.replenishment import record_replenishments
+
+    pool = await get_pool()
+    return await record_replenishments(
+        pool,
+        payload["user_id"],
+        payload["cart_id"],
+        lead_time_days=float(payload.get("lead_time_days", 2.0)),
+    )
+
+
+@activity.defn
+async def reconcile_arrivals_activity(user_id: str) -> list[dict]:
+    """Land every in-transit order whose ETA has passed: restock + notify.
+
+    Runs at the top of each grocery run and after a confirmed order's durable
+    delivery timer. Idempotent — a row lands exactly once — so overlapping callers
+    never double-restock or double-notify. Notifies the user only when something
+    actually landed.
+    """
+    from grocery_buddy.replenishment import reconcile_arrivals
+
+    pool = await get_pool()
+    landed = await reconcile_arrivals(pool, user_id)
+    if landed:
+        await send_arrival_notification(landed)
+    return landed
+
+
 # ── T9: Data loading ──────────────────────────────────────────────────────────
 
 
 @activity.defn
 async def load_user_data(user_id: str) -> dict:
     """Load inventory, consumption profiles, recent events, and preferences."""
+    from grocery_buddy.replenishment import get_incoming_by_product
+
     pool = await get_pool()
     inventory = await get_inventory(pool, user_id)
     profiles = await get_consumption_profile(pool, user_id)
     events = await get_recent_consumption_events(pool, user_id, lookback_days=30)
+    # Confirmed-but-not-yet-arrived orders. Prediction adds this to on-hand stock so a
+    # just-ordered item isn't suggested again while it's in transit.
+    incoming = await get_incoming_by_product(pool, user_id)
 
     row = await pool.fetchrow(
         "SELECT * FROM preferences WHERE user_id = $1",
@@ -108,6 +154,7 @@ async def load_user_data(user_id: str) -> dict:
         "buffer_days": float(prefs.get("buffer_days", 1.0)),
         "open_cart_exists": open_cart_exists,
         "recent_run_exists": recent_run_exists,
+        "incoming": incoming,
     }
 
 
@@ -158,6 +205,7 @@ async def predict_low_items_activity(user_data: dict) -> list[dict]:
         events_by_product,
         lead_time_days=user_data.get("lead_time_days", 2.0),
         buffer_days=user_data.get("buffer_days", 1.0),
+        incoming_by_product=user_data.get("incoming") or {},
     )
 
     return [
@@ -194,6 +242,7 @@ async def select_run_candidates_activity(user_data: dict) -> dict:
         events_by_product,
         lead_time_days=user_data.get("lead_time_days", 2.0),
         buffer_days=user_data.get("buffer_days", 1.0),
+        incoming_by_product=user_data.get("incoming") or {},
     )
 
     max_fillers = int(settings.free_shipping_max_fillers)

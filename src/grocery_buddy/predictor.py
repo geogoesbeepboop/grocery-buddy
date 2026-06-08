@@ -45,6 +45,10 @@ class LowItemResult:
     days_remaining: float
     effective_rate: float
     par_level: float
+    # Qty already on the way (confirmed-but-not-yet-arrived orders). The urgency math
+    # runs on qty + incoming, so a just-ordered item isn't flagged again — but we keep
+    # incoming separate so callers can still show the real on-hand number.
+    incoming: float = 0.0
 
 
 # ── Stock-level buckets ─────────────────────────────────────────────────────────
@@ -69,6 +73,7 @@ class StockLevel:
     effective_rate: float
     par_level: float
     bucket: str  # LOW | MEDIUM | LARGE
+    incoming: float = 0.0  # qty already on the way (counted toward the bucket)
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -127,17 +132,27 @@ def predict_low_items(
     events_by_product: dict[str, list[ConsumptionEvent]],
     lead_time_days: float = 2.0,
     buffer_days: float = 1.0,
+    incoming_by_product: dict[str, float] | None = None,
 ) -> list[LowItemResult]:
-    """Return items that need restocking, sorted by urgency."""
+    """Return items that need restocking, sorted by urgency.
+
+    ``incoming_by_product`` maps a product to qty already on the way (a confirmed
+    order in transit). That qty is added to on-hand for the urgency test, so an item
+    the user just ordered isn't flagged as low again until it's actually due to run
+    out *after* the incoming order is accounted for.
+    """
     profile_map = {p.product: p for p in profiles}
+    incoming_map = incoming_by_product or {}
     low: list[LowItemResult] = []
 
     for item in inventory:
         profile = profile_map.get(item.product)
+        incoming = incoming_map.get(item.product, 0.0)
+        eff_qty = item.qty + incoming
 
         if profile is None:
-            # No declared rate — flag if qty is at or below par level
-            if item.qty <= item.par_level:
+            # No declared rate — flag if effective qty is at or below par level
+            if eff_qty <= item.par_level:
                 low.append(LowItemResult(
                     product=item.product,
                     qty=item.qty,
@@ -145,14 +160,15 @@ def predict_low_items(
                     days_remaining=0.0,
                     effective_rate=0.0,
                     par_level=item.par_level,
+                    incoming=incoming,
                 ))
             continue
 
         events = events_by_product.get(item.product, [])
         rate = effective_daily_rate(profile, events)
-        d_left = days_left(item, rate)
+        d_left = float("inf") if rate <= 0 else eff_qty / rate
 
-        if is_low(item, rate, lead_time_days, buffer_days):
+        if d_left <= (lead_time_days + buffer_days):
             low.append(LowItemResult(
                 product=item.product,
                 qty=item.qty,
@@ -160,6 +176,7 @@ def predict_low_items(
                 days_remaining=d_left,
                 effective_rate=rate,
                 par_level=item.par_level,
+                incoming=incoming,
             ))
 
     return sorted(low, key=lambda x: x.days_remaining)
@@ -171,6 +188,7 @@ def classify_stock_levels(
     events_by_product: dict[str, list[ConsumptionEvent]],
     lead_time_days: float = 2.0,
     buffer_days: float = 1.0,
+    incoming_by_product: dict[str, float] | None = None,
     medium_days: float = MEDIUM_DAYS,
 ) -> list[StockLevel]:
     """Bucket every pantry item into low / medium / large stock.
@@ -179,29 +197,34 @@ def classify_stock_levels(
     that function returns), extended to cover the items we *don't* need to buy yet
     so /status can show the whole pantry and a scheduled run can skip the large
     ones. Items without a declared rate are bucketed by how their qty compares to
-    their par level. Sorted most-urgent first.
+    their par level. ``incoming_by_product`` (qty already on the way) is added to
+    on-hand for the bucket math, so a confirmed order shows as well-stocked rather
+    than re-flagged. Sorted most-urgent first.
     """
     profile_map = {p.product: p for p in profiles}
+    incoming_map = incoming_by_product or {}
     levels: list[StockLevel] = []
 
     for item in inventory:
         profile = profile_map.get(item.product)
+        incoming = incoming_map.get(item.product, 0.0)
+        eff_qty = item.qty + incoming
 
         if profile is None:
-            # No declared rate — fall back to par-level ratio.
+            # No declared rate — fall back to par-level ratio (on effective qty).
             rate = 0.0
             d_left = float("inf")
             par = item.par_level or 0.0
-            if item.qty <= par:
+            if eff_qty <= par:
                 bucket = LOW
-            elif item.qty <= 2 * par:
+            elif eff_qty <= 2 * par:
                 bucket = MEDIUM
             else:
                 bucket = LARGE
         else:
             events = events_by_product.get(item.product, [])
             rate = effective_daily_rate(profile, events)
-            d_left = days_left(item, rate)
+            d_left = float("inf") if rate <= 0 else eff_qty / rate
             if d_left <= lead_time_days + buffer_days:
                 bucket = LOW
             elif d_left <= medium_days:
@@ -217,6 +240,7 @@ def classify_stock_levels(
             effective_rate=rate,
             par_level=item.par_level,
             bucket=bucket,
+            incoming=incoming,
         ))
 
     return sorted(levels, key=lambda x: x.days_remaining)

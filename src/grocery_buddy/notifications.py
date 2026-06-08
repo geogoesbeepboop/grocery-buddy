@@ -193,18 +193,48 @@ async def send_checkout_link(
     """Tell the user their Amazon cart is staged and give them a checkout link.
 
     The agent does NOT place the order — it adds the approved items to the user's
-    Amazon cart and the user finishes checkout themselves via this link.
+    Amazon cart and the user finishes checkout themselves via this link. The
+    "✅ I placed the order" button (and a plain-text "ordered"/"done" reply) closes
+    the loop: it tells us the items are on the way so we update the pantry, mark them
+    in-transit, and stop re-suggesting them until they arrive.
     """
     cart_url = checkout_url or "https://www.amazon.com/gp/cart/view.html"
     msg = (
         f"🛒 <b>Your cart's ready — ${total_usd:.2f}</b>\n\n"
         "I've added everything to your Amazon cart. "
-        "<b>Nothing's been bought yet</b> — tap below to open your cart "
+        "<b>Nothing's been bought yet</b> — tap <b>Open my Amazon cart</b> "
         "(it opens right in your Amazon app where you're already signed in) "
-        "and finish checkout."
+        "and finish checkout.\n\n"
+        "Once you've placed the order, tap <b>I placed the order</b> (or just reply "
+        "<i>\"ordered\"</i>) and I'll add these to your pantry and stop suggesting them "
+        "while they're on the way."
     )
-    buttons = [{"text": "🧾 Open my Amazon cart", "url": cart_url}]
+    buttons = [
+        {"text": "🧾 Open my Amazon cart", "url": cart_url},
+        {"text": "✅ I placed the order", "callback_data": f"confirmed:{cart_id}"},
+    ]
     await send_telegram_message(msg, buttons=buttons)
+
+
+async def send_arrival_notification(landed: list[dict]) -> None:
+    """Tell the user an in-transit order arrived and the pantry was topped up.
+
+    ``landed`` — the lines just reconciled, each ``{product, qty, unit}``.
+    """
+    if not landed:
+        return
+    lines = ["📦 <b>Looks like your order landed — pantry topped up</b>"]
+    for it in landed:
+        name = (it.get("product") or "item").strip()
+        qty = float(it.get("qty") or 1)
+        unit = (it.get("unit") or "").strip()
+        qty_str = f" (+{qty:g} {unit})".rstrip() if (qty != 1 or unit) else ""
+        lines.append(f"• {name}{qty_str}")
+    lines.append(
+        "If anything didn't actually arrive, just tell me (e.g. <i>\"the milk never came\"</i>) "
+        "and I'll fix it."
+    )
+    await send_telegram_message("\n".join(lines))
 
 
 async def send_error_notification(message: str) -> None:

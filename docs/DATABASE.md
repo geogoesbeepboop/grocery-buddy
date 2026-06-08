@@ -2,27 +2,29 @@
 
 **Project:** `grocery-buddy` (Supabase, `looimknbtjhvwxbpkbyc`, us-east-1)
 **Engine:** PostgreSQL 17 via asyncpg (direct connection, session pooler)
-**Migrations:** `migrations/001`–`008` (15 tables). Apply each `.sql` in order in the Supabase SQL editor.
+**Migrations:** `migrations/001`–`009` (16 tables). Apply each `.sql` in order in the Supabase SQL editor.
 
 ## Entity relationship overview
 
 ```
 users
- ├── preferences            (1:1)
- ├── amazon_profiles        (1:many)
- ├── amazon_auth_challenges (1:many — 2FA-code relay mailbox, self-healing login)
- ├── schedules              (1:many — usually 1)
- ├── inventory_items        (1:many)
- ├── consumption_profile    (1:many)
- ├── consumption_events     (1:many)
- ├── import_proposals       (1:many — staged order-history imports, pre-confirmation)
- ├── conversation_state     (1:1 — Telegram chat flow state)
- └── carts                  (1:many)
-       ├── cart_items       (1:many)
-       ├── approvals        (1:many — usually 1)
-       └── purchases        (1:1)
+ ├── preferences             (1:1)
+ ├── amazon_profiles         (1:many)
+ ├── amazon_auth_challenges  (1:many — 2FA-code relay mailbox, self-healing login)
+ ├── schedules               (1:many — usually 1)
+ ├── inventory_items         (1:many)
+ ├── consumption_profile     (1:many)
+ ├── consumption_events      (1:many)
+ ├── pending_replenishments  (1:many — confirmed orders in transit, not yet arrived)
+ ├── import_proposals        (1:many — staged order-history imports, pre-confirmation)
+ ├── conversation_state      (1:1 — Telegram chat flow state)
+ └── carts                   (1:many)
+       ├── cart_items        (1:many)
+       ├── approvals         (1:many — usually 1)
+       ├── purchases         (1:1)
+       └── pending_replenishments (1:many — one per confirmed cart line, ON DELETE SET NULL)
 
-price_snapshots              (no FK — global price cache)
+price_snapshots               (no FK — global price cache)
 ```
 
 ---
@@ -163,7 +165,44 @@ The predictor uses the last 30 days of `delta < 0` events **with `source = 'user
 - `'inferred'` — the agent's own arithmetic depletion. Counting it would let the model feed back on itself.
 - `'correction'` — a user resetting their absolute on-hand quantity. A one-off ("family came over and used them all") shouldn't permanently inflate the steady-state rate.
 
-Purchases automatically log a positive delta (restocked).
+Purchases automatically log a positive delta (restocked). When an in-transit order's
+ETA passes, the arrival reconcile (`replenishment.reconcile_arrivals`) tops up the
+pantry and logs a `'purchase'` event for the delivered qty.
+
+---
+
+### `pending_replenishments`
+In-transit inventory — confirmed orders that haven't arrived yet (migration `009`).
+The "on the way" half of the pantry. One row per confirmed cart line.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `UUID PK` | |
+| `user_id` | `UUID → users.id` | |
+| `cart_id` | `UUID → carts.id` | **ON DELETE SET NULL** — a cart cleanup never drops an in-transit record the pantry math depends on |
+| `product` | `TEXT` | Canonical (normalized) product name |
+| `qty` | `FLOAT` | Quantity ordered |
+| `unit` | `TEXT` | |
+| `ordered_at` | `TIMESTAMPTZ` | When the user confirmed the order |
+| `eta` | `TIMESTAMPTZ` | Estimated arrival = `ordered_at + preferences.lead_time_days` |
+| `status` | `TEXT CHECK` | `'in_transit'` \| `'arrived'` \| `'cancelled'` |
+| `arrived_at` | `TIMESTAMPTZ` | Set when the arrival reconcile lands the row |
+| `created_at` | `TIMESTAMPTZ` | |
+
+**Lifecycle:**
+```
+in_transit  ──(eta passes → reconcile_arrivals)──►  arrived   (pantry topped up, 'purchase' event logged)
+    │
+    └────────(user: "it never came" / cancel)─────►  cancelled (stops counting as incoming)
+```
+
+While `in_transit`, the qty is summed into the predictor's `incoming_by_product` map
+and added to on-hand stock, so a confirmed order is **never re-suggested** until it's
+due to run out *after* the incoming order is accounted for.
+
+**Idempotency:** a partial unique index on `(cart_id, product) WHERE status =
+'in_transit'` means a double-confirm (button tap + text reply, or a webhook racing the
+workflow signal) can't create a second batch of in-transit rows.
 
 ---
 
@@ -205,13 +244,20 @@ One cart per grocery run. Progresses through a status state machine.
 draft
   └─► pending_approval        (briefing sent — ALWAYS; there is no auto-buy path)
         ├─► approved ─► checkout_ready   (Amazon cart staged, checkout link sent;
-        │                                 the user taps "Place order" themselves)
+        │                 │               the user taps "Place order" themselves)
+        │                 ├─► purchased   (user confirmed "I placed the order" →
+        │                 │                items recorded as in-transit, pantry will
+        │                 │                top up on arrival)
+        │                 └─► rejected    (user said they didn't order it after all)
         ├─► rejected
         └─► expired           (no response in 24h for GroceryRun / 6h for QuickBuy)
   └─► failed                  (any unrecoverable error)
 ```
-The agent never reaches a "purchased" state on its own — `checkout_ready` is the
-terminal success state, because the human completes checkout on Amazon.
+The agent still never *places* an order — the human completes checkout on Amazon. But
+`checkout_ready` is no longer terminal: when the user confirms they placed the order,
+the cart advances to `purchased` and its lines are recorded in
+`pending_replenishments` (in-transit) so the pantry tops up when they arrive and the
+agent stops re-suggesting them. See [SYSTEM_REFERENCE.md](SYSTEM_REFERENCE.md) §4.1.
 
 ---
 
@@ -258,11 +304,11 @@ Immutable record of every executed or attempted purchase.
 | `total_usd` | `DECIMAL(10,2)` | Actual total at checkout |
 | `payment_ref` | `TEXT` | Reserved for Stripe virtual card ref |
 | `idempotency_key` | `TEXT UNIQUE NOT NULL` | `'purchase-{cart_id}'` — prevents double purchase |
-| `status` | `TEXT CHECK` | `'pending'` \| `'completed'` \| `'failed'` |
+| `status` | `TEXT CHECK` | `'pending'` \| `'checkout_ready'` \| `'completed'` \| `'failed'` (migration `005` added `checkout_ready`) |
 | `error` | `TEXT` | Error message if `status = 'failed'` |
 | `created_at` | `TIMESTAMPTZ` | |
 
-**The `idempotency_key` UNIQUE constraint is the safety net.** Even if the Temporal activity retries, the `ON CONFLICT` on this column prevents a second purchase. The activity checks `status = 'completed'` before proceeding.
+**The `idempotency_key` UNIQUE constraint is the safety net.** Even if the Temporal activity retries, the `ON CONFLICT` on this column prevents a second purchase. The staging activity sets `checkout_ready` once the Amazon cart is staged; the record advances to `completed` only when the user **confirms they placed the order** (which also records the cart's lines as in-transit).
 
 ---
 
@@ -336,6 +382,8 @@ A timeout or a newer challenge `expires` it. See SYSTEM_REFERENCE §10.
 | `idx_purchases_idempotency` | `purchases(idempotency_key)` | Idempotency guard check |
 | `idx_import_proposals_user_status` | `import_proposals(user_id, status, created_at DESC)` | Find the active proposal for review |
 | `idx_amazon_auth_user_status` | `amazon_auth_challenges(user_id, status, created_at DESC)` | Find the latest pending 2FA challenge |
+| `idx_pending_replen_user_status` | `pending_replenishments(user_id, status, eta)` | Incoming-stock map + due-arrival reconcile |
+| `uq_pending_replen_cart_product` | `pending_replenishments(cart_id, product) WHERE status='in_transit'` | Idempotent confirm — one in-transit set per cart |
 
 ---
 
@@ -372,4 +420,10 @@ FROM purchases p
 JOIN carts c ON c.id = p.cart_id
 WHERE c.user_id = '<uuid>'
 ORDER BY p.created_at DESC;
+
+-- What's on the way right now (and what prediction treats as covered stock)
+SELECT product, qty, unit, eta
+FROM pending_replenishments
+WHERE user_id = '<uuid>' AND status = 'in_transit'
+ORDER BY eta;
 ```

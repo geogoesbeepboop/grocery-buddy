@@ -60,6 +60,13 @@ class Settings(BaseSettings):
     # never blocked by this.
     run_cooldown_minutes: int = 180
 
+    # After staging a checkout, how long the workflow keeps a durable ear open for
+    # the user's "I placed the order" confirmation before it gives up. On confirm,
+    # the items become in-transit and the workflow sleeps until their estimated
+    # arrival to top up the pantry. If the user never confirms, we simply never
+    # assume the order happened. 72h covers a weekend.
+    purchase_confirm_wait_hours: int = 72
+
     # Amazon automation
     amazon_profile_dir: str = ".amazon-session"
     amazon_headless: bool = True

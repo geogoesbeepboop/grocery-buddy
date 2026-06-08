@@ -6,7 +6,9 @@ change behavior, update this file.
 
 > Companion docs: [ARCHITECTURE.md](ARCHITECTURE.md) (why the stack is shaped this
 > way), [DATABASE.md](DATABASE.md) (schema detail), [OPERATIONS.md](OPERATIONS.md),
-> [SETUP.md](SETUP.md), [HOSTING.md](HOSTING.md).
+> [SETUP.md](SETUP.md), [HOSTING.md](HOSTING.md),
+> [FEATURES_AND_ROADMAP.md](FEATURES_AND_ROADMAP.md) (what's next),
+> [PROCUREMENT_CONVERGENCE.md](PROCUREMENT_CONVERGENCE.md) (the merge decision).
 
 ---
 
@@ -28,10 +30,17 @@ of which call Claude) → notification back to Telegram.**
 Two safety invariants hold everywhere:
 
 1. **We never place an order.** The agent stages an Amazon cart and hands back a
-   checkout link; the human taps "Place order."
+   checkout link; the human taps "Place order." (The agent then *remembers* a
+   confirmed order — tracking it as in-transit and topping up the pantry on arrival —
+   but it still never spends money itself.)
 2. **Nothing touches the live pantry or a cart without the user's say-so** — every
-   purchase passes an approval gate, and the order-history import stages a proposal
-   the user confirms before it's written.
+   purchase passes an approval gate, the order-history import stages a proposal the
+   user confirms before it's written, and the pantry only auto-tops-up *after* the
+   user confirms they placed the order.
+
+The pantry is a single picture of **on-hand + on-the-way**: once you confirm an order,
+its items are counted as covered stock so the agent won't re-suggest them, and they
+convert to on-hand when their estimated delivery date passes (§7, §4.1).
 
 ---
 
@@ -63,11 +72,12 @@ flowchart LR
 ```mermaid
 flowchart TD
     M[Telegram update] --> B{button tap?}
-    B -- yes --> SIG[signal cart's workflow<br/>approve / reject] --> done1([done])
+    B -- "approve / reject" --> SIG[signal cart's workflow] --> done1([done])
+    B -- "confirmed<br/>'I placed the order'" --> CFM[record in-transit + signal confirm_purchase] --> done1
     B -- no --> CMD{slash command?}
     CMD -- /import --> IMP[[ImportHistoryWorkflow]]
     CMD -- /start --> ONB[onboarding interview]
-    CMD -- /status --> ST[pantry + cart + schedule]
+    CMD -- /status --> ST[pantry + on-the-way + cart + schedule]
     CMD -- /help --> HLP[capabilities message]
     CMD -- "free text" --> MODE{conversation mode}
     MODE -- onboarding --> ONB
@@ -75,7 +85,9 @@ flowchart TD
     MODE -- first message ever --> ONB
     MODE -- returning --> PEND{cart pending?}
     PEND -- yes --> BR[[briefing-reply tree]]
-    PEND -- no --> FR[[fresh-request tree]]
+    PEND -- no --> AWAIT{staged checkout<br/>awaiting confirm?}
+    AWAIT -- "'ordered' / 'didn't order'" --> CFM2[confirm / set-aside the checkout] --> done1
+    AWAIT -- "else / ambiguous" --> FR[[fresh-request tree]]
 ```
 
 ### Reply when a cart is pending (least-friction rule)
@@ -100,9 +112,27 @@ stateDiagram-v2
     pending_approval --> checkout_ready: approve → prepare_checkout_activity<br/>(stage Amazon cart, send link)
     pending_approval --> rejected: reject
     pending_approval --> expired: 24h (GroceryRun) / 6h (QuickBuy)
-    checkout_ready --> [*]: user taps "Place order" on Amazon
+    checkout_ready --> purchased: user confirms "I placed the order"<br/>(→ in-transit replenishments)
+    checkout_ready --> rejected: "I didn't order it"
+    checkout_ready --> [*]: no confirmation (left checkout_ready)
+    purchased --> [*]
     rejected --> [*]
     expired --> [*]
+```
+
+### In-transit replenishment lifecycle (after "I placed the order")
+```mermaid
+stateDiagram-v2
+    [*] --> in_transit: confirm → record_replenishments<br/>(eta = ordered_at + lead_time)
+    in_transit --> arrived: eta passes → reconcile_arrivals<br/>(restock pantry, log 'purchase' event)
+    in_transit --> cancelled: "the milk never came"
+    arrived --> [*]
+    cancelled --> [*]
+    note right of in_transit
+      while in_transit, qty counts as
+      incoming stock → prediction won't
+      re-suggest the item
+    end note
 ```
 
 ### Order-history import pipeline (`/import`)
@@ -247,18 +277,24 @@ with no LLM call when there's no preference or a single candidate.
 ## 4. Deterministic workflows (Temporal)
 
 Registered in `workflows/worker.py` on task queue `grocery-buddy`. All three share
-the `approve`/`reject` signals and the `notify_activity` reporter.
+the `approve`/`reject` signals and the `notify_activity` reporter. GroceryRun and
+QuickBuy additionally share the post-checkout `confirm_purchase`/`mark_not_purchased`
+signals (the in-transit loop, below).
 
 ### 4.1 `GroceryRunWorkflow` — scheduled/manual restock
 Trigger: Temporal Schedule (cron) or manual start. `trigger ∈ {schedule, manual, onboarding}`.
 
 ```
+reconcile_arrivals_activity        → land any in-transit order whose ETA passed
+                                     (restock pantry) BEFORE predicting (idempotent)
 apply_estimated_depletion_activity → decay on-hand estimates since last reconcile
-load_user_data                     → inventory, profiles, events, prefs + guardrails
+load_user_data                     → inventory, profiles, events, prefs, INCOMING + guardrails
   └─ guardrails (scheduled runs only): skip if a cart is already pending_approval;
      skip if another run happened within run_cooldown_minutes
 select_run_candidates_activity     → must-buy (predictor §7) + fillers (soonest-due
                                      mediums) to clear free shipping
+  └─ prediction adds INCOMING (in-transit qty) to on-hand, so a just-ordered item
+     is not re-suggested while on the way
   └─ no must-buy → notify "well stocked", end  (never runs on fillers alone)
 lookup_amazon_prices               → Playwright search + brand-aware selection
 assemble_run_cart_activity         → keep every must-buy; add fillers only until the
@@ -268,22 +304,39 @@ send_approval_notification         → Telegram briefing (compose_briefing)
 update_cart_status → pending_approval
 wait_condition(decision, timeout = 24h)     ◄── approve/reject signal from webhook
   ├─ approved → update_cart_status(approved) → prepare_checkout_activity (stage Amazon
-  │             cart, send checkout link, NO_RETRY) → run_evals_activity
+  │             cart, send checkout link + "I placed the order" button, NO_RETRY)
+  │             → run_evals_activity → _await_purchase_confirmation (in-transit loop ▼)
   └─ rejected/expired → update_cart_status → run_evals_activity, done
+
+_await_purchase_confirmation:  (the in-transit loop — closes the post-checkout gap)
+  wait_condition(purchase_decision, timeout = purchase_confirm_wait_hours/72h)
+    ◄── confirm_purchase / mark_not_purchased signal from webhook
+  ├─ confirmed     → record_replenishments_activity (cart lines → in-transit,
+  │                  eta = ordered_at + lead_time) → workflow.sleep(until eta)
+  │                  → reconcile_arrivals_activity (restock + "it arrived" nudge)
+  ├─ not_purchased → update_cart_status(rejected)
+  └─ timeout       → leave checkout_ready (never assume an order happened)
 ```
-Note: **always requires approval** — there is no auto-purchase path (the
-`auto_purchase_cap_usd` setting is reserved for a future auto-buy tier). A top-level
+Note: **still no auto-purchase** — the human taps "Place order" on Amazon. What the
+in-transit loop adds is *memory* of a confirmed order: it tracks the delivery and
+tops up the pantry on arrival, so the agent doesn't re-suggest eggs it already bought.
+The `confirm_purchase` signal is best-effort/elegant; the webhook writes the in-transit
+rows synchronously on the tap, and the run-start `reconcile_arrivals_activity` is the
+safety net that lands arrivals even if a worker missed the durable timer. A top-level
 `try/except` notifies the user on any unexpected failure so a run never ends in silence.
 
 ### 4.2 `QuickBuyWorkflow` — ad-hoc "buy X now"
 Trigger: `quick_buy` / `buy_items` actions. No guardrails (ad-hoc is never
 cooldown-blocked). Same shape as GroceryRun but skips prediction (items are given)
-and uses a **6h** approval timeout (ad-hoc requests are time-sensitive).
+and uses a **6h** approval timeout (ad-hoc requests are time-sensitive). It runs the
+**same in-transit confirmation loop** after checkout — crucial because "I need eggs
+early" is exactly the case that must not be re-suggested by the next scheduled run.
 
 ```
 load_user_data (for brand prefs) → lookup_amazon_prices → build_draft_cart
 → send_approval_notification → wait_condition(6h)
    ├─ approved → prepare_checkout_activity → checkout link
+   │             → _await_purchase_confirmation (in-transit loop, §4.1)
    └─ rejected/expired → done
 ```
 
@@ -309,8 +362,10 @@ All I/O lives here; workflows stay pure.
 | Activity | Does |
 |---|---|
 | `notify_activity` | Send a plain Telegram message (no-op/skip/failure reporting) |
+| `reconcile_arrivals_activity` | Land in-transit orders past their ETA: restock pantry + log `purchase` events + "it arrived" nudge (idempotent) |
+| `record_replenishments_activity` | Record a confirmed cart's lines as in-transit (eta = ordered_at + lead_time); idempotent per cart |
 | `apply_estimated_depletion_activity` | Decay on-hand estimates by assumed use since last reconcile |
-| `load_user_data` | Load inventory, profiles, events, prefs + guardrail signals |
+| `load_user_data` | Load inventory, profiles, events, prefs, **incoming** (in-transit) map + guardrail signals |
 | `predict_low_items_activity` | Run the rule-based predictor → low items |
 | `select_run_candidates_activity` | Split into must-buy (low now) + fillers (soonest-due mediums) to clear free shipping; returns `threshold_usd`, `max_fillers` |
 | `lookup_amazon_prices` | Playwright search + brand-aware candidate selection (Haiku) |
@@ -327,7 +382,7 @@ All I/O lives here; workflows stay pure.
 | `synthesize_pantry_from_orders_activity` | Sonnet synthesis wrapper |
 | `present_import_proposal_activity` | Stage proposal + enter review mode + send it |
 
-All 18 activities live here; the workflows themselves stay pure (no I/O).
+All 20 activities live here; the workflows themselves stay pure (no I/O).
 
 ---
 
@@ -361,19 +416,26 @@ See §3 — these are the `tools=[...]` handed to each Claude call. They are the
 ```
 message
 ├─ callback button (approve/reject)         → signal the cart's workflow
+├─ callback button (confirmed)              → record in-transit + signal confirm_purchase
 ├─ /clear                                    → wipe pantry+habits (hidden)
 ├─ /start | /restart | /onboard              → reset + start onboarding
 ├─ /import | /importorders                   → start ImportHistoryWorkflow
-├─ /status                                    → pantry summary + pending cart + schedule
+├─ /status                                    → pantry + on-the-way + pending cart + schedule
 ├─ /help                                      → capabilities message (leads with /import)
 └─ free text → look up conversation mode:
      ├─ mode == onboarding     → advance_onboarding turn
      ├─ mode == import_review  → advance_import_review turn (§6.4)
      ├─ first message ever     → start onboarding
      └─ returning user:
-          ├─ pending cart exists → briefing-reply tree (§6.3)
-          └─ else                → fresh-request tree (§6.2)
+          ├─ pending cart exists           → briefing-reply tree (§6.3)
+          ├─ staged checkout awaiting confirm AND reply clearly confirms/denies
+          │                                 → confirm (record in-transit) / set aside
+          └─ else                          → fresh-request tree (§6.2)
 ```
+The awaiting-confirmation check uses a **tight keyword classifier**
+(`_classify_checkout_followup`) so an outstanding checkout only swallows a reply that
+clearly says "ordered" / "didn't order" — anything ambiguous ("we're out of milk")
+falls through to normal handling.
 
 ### 6.2 Fresh request (no pending cart) — `_handle_fresh_request`
 Builds a pantry snapshot, calls `parse_request`, then:
@@ -381,6 +443,7 @@ Builds a pantry snapshot, calls `parse_request`, then:
 quick_buy          → start QuickBuyWorkflow with named items
 start_grocery_run  → start GroceryRunWorkflow (trigger=manual)   ← "buy all I'm low on"
 update_inventory   → correct on-hand quantities
+report_not_arrived → cancel in-transit rows for named items   ← "the milk never came"
 update_schedule    → upsert the cron schedule
 chat               → reply (can answer "what am I low on?" from the snapshot)
 ```
@@ -422,14 +485,21 @@ manual / onboarding triggers bypass both guardrails (always run, always report)
 
 ---
 
-## 7. Prediction & stock (rule-based, no LLM) — `predictor.py`, `stock.py`, `depletion.py`
-- `predict_low_items`: `days_left = qty / effective_daily_rate`; flag items where
-  `days_left ≤ lead_time + buffer`. `effective_daily_rate` blends the declared habit
-  (prior) with observed consumption events (posterior, capped weight).
+## 7. Prediction & stock (rule-based, no LLM) — `predictor.py`, `stock.py`, `depletion.py`, `replenishment.py`
+- `predict_low_items`: `days_left = (qty + incoming) / effective_daily_rate`; flag
+  items where `days_left ≤ lead_time + buffer`. `effective_daily_rate` blends the
+  declared habit (prior) with observed consumption events (posterior, capped weight).
+  **`incoming`** is the in-transit qty (confirmed-but-not-arrived orders) — added to
+  on-hand so a just-ordered item isn't re-flagged while on the way.
 - `classify_stock_levels` / `summarize_stock`: bucket every item into LOW / MEDIUM /
-  LARGE — powers `/status` and the assistant's pantry snapshot.
+  LARGE (also incoming-aware) — powers `/status` and the assistant's pantry snapshot.
 - `apply_estimated_depletion`: advances on-hand estimates between runs so prediction
   sees fresh numbers; idempotent (only advances items it decrements).
+- `replenishment.py` (the in-transit half of the pantry): `record_replenishments`
+  (confirm → in-transit rows), `get_incoming_by_product` (the prediction input),
+  `reconcile_arrivals` (eta passed → restock, idempotent), `cancel_in_transit`
+  ("never came"), `eta_for` (pure shipping-time math). See §4.1 and DATABASE.md
+  `pending_replenishments`.
 
 ---
 
@@ -445,20 +515,25 @@ manual / onboarding triggers bypass both guardrails (always run, always report)
 
 ### 8.2 Postgres tables (migrations) — see [DATABASE.md](DATABASE.md)
 `users`, `inventory_items`, `consumption_profile`, `consumption_events`,
-`preferences`, `carts`, `cart_items`, `purchases`, `approvals`, `price_snapshots`,
-`schedules`, `amazon_profiles`, `conversation_state`, `import_proposals`,
-`amazon_auth_challenges` (15 tables, migrations `001`–`008`).
+`pending_replenishments`, `preferences`, `carts`, `cart_items`, `purchases`,
+`approvals`, `price_snapshots`, `schedules`, `amazon_profiles`, `conversation_state`,
+`import_proposals`, `amazon_auth_challenges` (16 tables, migrations `001`–`009`).
 
 Conversation modes (`conversation_state.mode`): `idle`, `onboarding`,
 `import_review`, `amazon_2fa` (set while relaying a one-time code, §10).
-Cart statuses: `draft → pending_approval → {checkout_ready | rejected | expired | failed}`.
+Cart statuses: `draft → pending_approval → checkout_ready → {purchased | rejected}`,
+plus `{rejected | expired | failed}` from earlier states.
+In-transit statuses (`pending_replenishments.status`): `in_transit → {arrived | cancelled}`.
 
 ---
 
 ## 9. Notifications & entry points
 - **Outbound** (`notifications.py`, Telegram): `send_telegram_message`,
-  `send_briefing` (approval push w/ inline buttons), `send_checkout_link`.
-- **Inbound:** `webhook.py` `/telegram` (messages + button callbacks), `/health`.
+  `send_briefing` (approval push w/ inline buttons), `send_checkout_link` (checkout
+  link + "I placed the order" confirm button), `send_arrival_notification`
+  ("order landed — pantry topped up").
+- **Inbound:** `webhook.py` `/telegram` (messages + button callbacks: approve / reject
+  / confirmed), `/health`.
 - **CLI** (`cli.py`): `onboard`, `worker`, `run`, `webhook`, `schedule`, `evals`,
   `mcp`, `ask` (drives `parse_request` from the terminal).
 - **Scripts:** `scripts/setup_amazon_session.py` (save a login interactively),

@@ -179,6 +179,35 @@ _RESTOCK_TOOL: dict = {
     "input_schema": {"type": "object", "properties": {}, "required": []},
 }
 
+# ── "It didn't arrive" tool (cancels in-transit so the item is needed again) ──
+
+_NOT_ARRIVED_TOOL: dict = {
+    "name": "report_not_arrived",
+    "description": (
+        "The user is telling you an order they placed did NOT arrive, or that they "
+        "cancelled / want to cancel an order that was on the way — e.g. 'the milk never "
+        "came', 'my eggs didn't show up', 'cancel that coffee order', 'that order fell "
+        "through'. This takes those items off the 'on the way' list so they count as "
+        "needed again. Use ONLY for items that were ordered and in transit — for normal "
+        "on-hand corrections use update_pantry_quantity instead."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "description": "Products that didn't arrive / should be cancelled.",
+                "items": {
+                    "type": "object",
+                    "properties": {"product": {"type": "string", "description": "Product name"}},
+                    "required": ["product"],
+                },
+            },
+        },
+        "required": ["items"],
+    },
+}
+
 _FRESH_TOOLS: list[dict] = [
     {
         "name": "request_purchase",
@@ -209,6 +238,7 @@ _FRESH_TOOLS: list[dict] = [
     },
     _RESTOCK_TOOL,
     _UPDATE_INVENTORY_TOOL,
+    _NOT_ARRIVED_TOOL,
     _SCHEDULE_TOOL,
 ]
 
@@ -410,6 +440,9 @@ async def parse_request(message: str, stock_summary: str | None = None) -> dict:
         "• update_pantry_quantity — they're telling you how much they CURRENTLY have, not "
         "buying ('we still have plenty of eggs', 'we're out of milk', 'the kids finished "
         "the bread'). This corrects the estimate; it buys nothing.\n"
+        "• report_not_arrived — an order that was on the way did NOT arrive or is being "
+        "cancelled ('the milk never came', 'cancel that coffee order'). Removes it from "
+        "the on-the-way list so it counts as needed again.\n"
         "• update_schedule — change when/how often the briefing runs (convert to a UTC "
         "cron expression).\n"
         "• Otherwise just reply. Answer pantry questions ('what am I low on?') from the "
@@ -445,6 +478,15 @@ async def parse_request(message: str, stock_summary: str | None = None) -> dict:
             items = _build_qty_items(args.get("items", []))
             if items:
                 return {"action": "update_inventory", "items": items}
+
+        if block.name == "report_not_arrived":
+            products = [
+                (it.get("product") or "").strip()
+                for it in args.get("items", [])
+                if (it.get("product") or "").strip()
+            ]
+            if products:
+                return {"action": "report_not_arrived", "items": products}
 
         if block.name == "update_schedule":
             return {

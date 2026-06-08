@@ -15,18 +15,32 @@ SANDBOX RULES (Temporal Python SDK):
     playwright, httpx) never get pulled into the sandbox.
 """
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
+    from grocery_buddy.config import settings
     from grocery_buddy.models import GroceryRunInput, GroceryRunResult
 
 _ACTIVITY_TIMEOUT = timedelta(minutes=10)
 _PURCHASE_TIMEOUT = timedelta(minutes=15)
 _SHORT_TIMEOUT = timedelta(minutes=2)
 _APPROVAL_WAIT = timedelta(hours=24)
+# How long to keep a durable ear open for "I placed the order" after staging checkout.
+_CONFIRM_WAIT = timedelta(hours=settings.purchase_confirm_wait_hours)
+
+
+def _parse_eta(eta_iso: str | None) -> datetime | None:
+    """Parse an ISO ETA from the record activity into an aware datetime (or None)."""
+    if not eta_iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(eta_iso)
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 _STANDARD_RETRY = RetryPolicy(
     initial_interval=timedelta(seconds=5),
@@ -43,6 +57,7 @@ class GroceryRunWorkflow:
 
     def __init__(self) -> None:
         self._decision: str | None = None  # set by approve/reject signals
+        self._purchase_decision: str | None = None  # set after checkout: confirmed/not_purchased
 
     @workflow.signal
     async def approve(self) -> None:
@@ -51,6 +66,16 @@ class GroceryRunWorkflow:
     @workflow.signal
     async def reject(self) -> None:
         self._decision = "rejected"
+
+    @workflow.signal
+    async def confirm_purchase(self) -> None:
+        """The user placed the staged order — items are now on the way."""
+        self._purchase_decision = "confirmed"
+
+    @workflow.signal
+    async def mark_not_purchased(self) -> None:
+        """The user decided not to place the staged order after all."""
+        self._purchase_decision = "not_purchased"
 
     async def _notify(self, message: str) -> None:
         """Best-effort user-facing message so a run never ends in silence."""
@@ -84,7 +109,18 @@ class GroceryRunWorkflow:
         workflow_id = workflow.info().workflow_id
         is_scheduled = payload.trigger == "schedule"
 
-        # ── 0. Assume consumption since we last looked ─────────────────────────
+        # ── 0a. Land anything that arrived ─────────────────────────────────────
+        # Any in-transit order whose ETA has passed becomes on-hand stock before we
+        # predict, so the pantry reflects deliveries even if the per-order delivery
+        # timer was missed (worker down, etc.). Idempotent — lands each row once.
+        await workflow.execute_activity(
+            "reconcile_arrivals_activity",
+            user_id,
+            schedule_to_close_timeout=_SHORT_TIMEOUT,
+            retry_policy=_STANDARD_RETRY,
+        )
+
+        # ── 0b. Assume consumption since we last looked ────────────────────────
         # Decay each item's estimated qty by (rate × days elapsed) so prediction
         # works off the freshest estimate. The user's last confirmed actual_qty is
         # untouched — corrections snap the estimate back to it.
@@ -266,7 +302,12 @@ class GroceryRunWorkflow:
                 schedule_to_close_timeout=_SHORT_TIMEOUT,
                 retry_policy=_STANDARD_RETRY,
             )
-            return GroceryRunResult(status="checkout_ready", cart_id=cart_id)
+            # The cart is staged and the user has a checkout link. Stay alive to close
+            # the loop: wait for "I placed the order", then track the delivery and top
+            # up the pantry when it lands.
+            return await self._await_purchase_confirmation(
+                user_id, cart_id, float(user_data.get("lead_time_days", 2.0))
+            )
 
         # Rejected or expired
         await workflow.execute_activity(
@@ -282,3 +323,57 @@ class GroceryRunWorkflow:
             retry_policy=_STANDARD_RETRY,
         )
         return GroceryRunResult(status=final_status, cart_id=cart_id)
+
+    async def _await_purchase_confirmation(
+        self, user_id: str, cart_id: str, lead_time_days: float
+    ) -> GroceryRunResult:
+        """Close the loop after checkout: confirm → in-transit → delivered → restock.
+
+        Waits (durably) for the user to confirm they placed the staged order. The
+        webhook records the in-transit items immediately on the tap, so this is the
+        elegant half: on confirm we (idempotently) ensure they're recorded, then sleep
+        a durable timer until the estimated arrival and top up the pantry. We never
+        assume an order happened — silence just leaves the cart checkout_ready.
+        """
+        try:
+            await workflow.wait_condition(
+                lambda: self._purchase_decision is not None,
+                timeout=_CONFIRM_WAIT,
+            )
+        except asyncio.TimeoutError:
+            workflow.logger.info("No confirmation for cart %s — leaving checkout_ready", cart_id)
+            return GroceryRunResult(status="checkout_ready", cart_id=cart_id)
+
+        if self._purchase_decision == "not_purchased":
+            await workflow.execute_activity(
+                "update_cart_status",
+                {"cart_id": cart_id, "status": "rejected"},
+                schedule_to_close_timeout=_SHORT_TIMEOUT,
+                retry_policy=_STANDARD_RETRY,
+            )
+            return GroceryRunResult(status="rejected", cart_id=cart_id)
+
+        # Confirmed. Ensure the items are logged as in-transit (idempotent — the
+        # webhook usually did this already on the button tap).
+        summary = await workflow.execute_activity(
+            "record_replenishments_activity",
+            {"cart_id": cart_id, "user_id": user_id, "lead_time_days": lead_time_days},
+            schedule_to_close_timeout=_SHORT_TIMEOUT,
+            retry_policy=_STANDARD_RETRY,
+        )
+
+        # Durable delivery timer: sleep until the estimated arrival, then reconcile.
+        # The run-start reconcile is the safety net; this gives a timely "it arrived"
+        # nudge without waiting for the next scheduled run.
+        eta = _parse_eta(summary.get("eta"))
+        if eta is not None:
+            delay = eta - workflow.now()
+            if delay > timedelta(0):
+                await workflow.sleep(delay)
+        await workflow.execute_activity(
+            "reconcile_arrivals_activity",
+            user_id,
+            schedule_to_close_timeout=_SHORT_TIMEOUT,
+            retry_policy=_STANDARD_RETRY,
+        )
+        return GroceryRunResult(status="purchased", cart_id=cart_id)

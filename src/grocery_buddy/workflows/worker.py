@@ -21,6 +21,8 @@ from grocery_buddy.workflows.activities import (
     predict_low_items_activity,
     prepare_checkout_activity,
     present_import_proposal_activity,
+    reconcile_arrivals_activity,
+    record_replenishments_activity,
     run_evals_activity,
     scrape_amazon_orders_activity,
     select_run_candidates_activity,
@@ -48,6 +50,8 @@ async def run_worker() -> None:
         workflows=[GroceryRunWorkflow, QuickBuyWorkflow, ImportHistoryWorkflow],
         activities=[
             apply_estimated_depletion_activity,
+            reconcile_arrivals_activity,
+            record_replenishments_activity,
             load_user_data,
             predict_low_items_activity,
             select_run_candidates_activity,

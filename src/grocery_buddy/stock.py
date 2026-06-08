@@ -33,10 +33,17 @@ async def summarize_stock(
     lead_time_days: float = 2.0,
     buffer_days: float = 1.0,
 ) -> list[StockLevel]:
-    """Load the user's pantry and classify each item by stock level."""
+    """Load the user's pantry and classify each item by stock level.
+
+    Counts in-transit orders (confirmed but not yet arrived) as covered stock, so an
+    item the user just ordered shows as well-stocked here and isn't re-flagged as low.
+    """
+    from grocery_buddy.replenishment import get_incoming_by_product
+
     inventory_rows = await get_inventory(pool, user_id)
     profile_rows = await get_consumption_profile(pool, user_id)
     event_rows = await get_recent_consumption_events(pool, user_id, lookback_days=30)
+    incoming_by_product = await get_incoming_by_product(pool, user_id)
 
     inventory = [
         InventoryItem(
@@ -67,7 +74,8 @@ async def summarize_stock(
         )
 
     return classify_stock_levels(
-        inventory, profiles, events_by_product, lead_time_days, buffer_days
+        inventory, profiles, events_by_product, lead_time_days, buffer_days,
+        incoming_by_product=incoming_by_product,
     )
 
 
@@ -137,3 +145,38 @@ def format_stock_summary(levels: list[StockLevel]) -> str:
         parts.append("\n".join(lines))
 
     return "\n\n".join(parts)
+
+
+def _eta_phrase(eta: datetime) -> str:
+    """Friendly relative ETA: 'today', 'tomorrow', 'in N days', else a short date."""
+    from datetime import timezone
+
+    now = datetime.now(eta.tzinfo or timezone.utc)
+    days = (eta.date() - now.date()).days
+    if days <= 0:
+        return "expected today"
+    if days == 1:
+        return "expected tomorrow"
+    if days <= 6:
+        return f"expected in {days} days"
+    return f"expected {eta.strftime('%b %-d')}"
+
+
+def format_in_transit(items: list[dict]) -> str:
+    """Render the 'on the way' block for /status from get_in_transit() rows.
+
+    Each row is ``{product, qty, unit, eta}``. Returns '' when nothing is in transit
+    so the caller can omit the section entirely.
+    """
+    if not items:
+        return ""
+    lines = ["🚚 <b>On the way</b> — already ordered, I won't re-suggest these"]
+    for it in items:
+        name = (it.get("product") or "item").strip()
+        qty = float(it.get("qty") or 1)
+        unit = (it.get("unit") or "").strip()
+        qty_str = f" ({qty:g} {unit})".rstrip() if (qty != 1 or unit) else ""
+        eta = it.get("eta")
+        eta_str = f" · {_eta_phrase(eta)}" if isinstance(eta, datetime) else ""
+        lines.append(f"• {name}{qty_str}{eta_str}")
+    return "\n".join(lines)

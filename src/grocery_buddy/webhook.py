@@ -233,6 +233,142 @@ async def _get_pending_cart(user_id: str) -> dict | None:
     }
 
 
+# ── Purchase confirmation ("did you place the order?") ────────────────────────
+
+
+async def _get_awaiting_confirmation_cart(user_id: str) -> dict | None:
+    """Most recent staged-but-unconfirmed checkout still inside the confirm window."""
+    from grocery_buddy.db import get_pool
+
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """
+        SELECT id, workflow_id FROM carts
+        WHERE user_id = $1 AND status = 'checkout_ready'
+          AND updated_at > NOW() - ($2 || ' hours')::INTERVAL
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
+        uuid.UUID(user_id), str(settings.purchase_confirm_wait_hours),
+    )
+    return {"cart_id": str(row["id"]), "workflow_id": row["workflow_id"]} if row else None
+
+
+# Tight keyword sets — we only hijack a message as a checkout follow-up when it
+# clearly confirms or denies, so an outstanding checkout never swallows a normal
+# request ("we're out of milk"). Deny is checked first so "didn't order" doesn't
+# match the "order" in the confirm set.
+_CONFIRM_WORDS = (
+    "ordered", "placed", "bought", "purchased", "checked out", "check out done",
+    "paid", "order placed", "i did it", "did it", "got it", "all set",
+)
+_DENY_WORDS = (
+    "didn't order", "did not order", "didnt order", "haven't ordered", "havent ordered",
+    "not yet", "never mind", "nevermind", "changed my mind", "decided not to", "cancel",
+)
+_CONFIRM_EXACT = {"yes", "yep", "yeah", "y", "done", "ordered", "✅", "👍"}
+
+
+def _classify_checkout_followup(text: str) -> str | None:
+    """Classify a reply as 'confirm' / 'deny' / None against an outstanding checkout."""
+    t = text.strip().lower()
+    if any(w in t for w in _DENY_WORDS):
+        return "deny"
+    if t in _CONFIRM_EXACT or any(w in t for w in _CONFIRM_WORDS):
+        return "confirm"
+    return None
+
+
+def _format_eta(eta_iso: str | None) -> str:
+    """Short human ETA ('Jun 7') from the record-replenishments summary, or ''."""
+    if not eta_iso:
+        return ""
+    from datetime import datetime
+
+    try:
+        dt = datetime.fromisoformat(eta_iso)
+    except (TypeError, ValueError):
+        return ""
+    return dt.strftime("%b %-d")
+
+
+async def _confirm_purchase_for_cart(cart_id: str) -> None:
+    """Record a confirmed order's items as in-transit and nudge the staging workflow.
+
+    Idempotent and works whether the staging workflow is still alive: the DB write
+    (via record_replenishments) is the source of truth; the confirm_purchase signal
+    only enables the workflow's timely "it arrived" nudge. Triggered by the inline
+    button and by a confirming text reply.
+    """
+    from grocery_buddy.db import get_pool
+    from grocery_buddy.notifications import send_telegram_message
+    from grocery_buddy.replenishment import record_replenishments
+
+    user_id = settings.grocery_buddy_user_id
+    pool = await get_pool()
+
+    row = await pool.fetchrow(
+        "SELECT workflow_id FROM carts WHERE id = $1", uuid.UUID(cart_id)
+    )
+    if not row:
+        await send_telegram_message(
+            "I couldn't find that order anymore — it may have already been handled."
+        )
+        return
+
+    lead = float(await pool.fetchval(
+        "SELECT lead_time_days FROM preferences WHERE user_id = $1", uuid.UUID(user_id)
+    ) or 2.0)
+
+    try:
+        summary = await record_replenishments(pool, user_id, cart_id, lead_time_days=lead)
+    except Exception as exc:
+        logger.error("record_replenishments failed for cart %s: %s", cart_id, exc)
+        await send_telegram_message(_MSG_ERROR)
+        return
+
+    # Best-effort: wake the staging workflow so it tracks the delivery + tops up on ETA.
+    wf = row["workflow_id"]
+    if wf:
+        try:
+            await _signal(wf, "confirm_purchase")
+        except Exception as exc:
+            logger.info("confirm_purchase signal skipped for %s: %s", wf, exc)
+
+    items = summary.get("items", [])
+    names = ", ".join(i["product"] for i in items[:6])
+    more = "" if len(items) <= 6 else f" +{len(items) - 6} more"
+    eta = _format_eta(summary.get("eta"))
+    eta_phrase = f" — expected around <b>{eta}</b>" if eta else ""
+    await send_telegram_message(
+        f"✅ <b>Got it, marked as ordered.</b>\nI'll treat {names}{more} as on the way"
+        f"{eta_phrase}, keep them out of your next list, and top up your pantry when they "
+        "land. If something doesn't show up, just tell me."
+    )
+
+
+async def _mark_not_purchased_for_cart(cart_id: str, workflow_id: str | None) -> None:
+    """User decided not to place the staged order — set it aside, pantry untouched."""
+    from grocery_buddy.db import get_pool
+    from grocery_buddy.notifications import send_telegram_message
+
+    if workflow_id:
+        try:
+            await _signal(workflow_id, "mark_not_purchased")
+        except Exception as exc:
+            logger.info("mark_not_purchased signal skipped for %s: %s", workflow_id, exc)
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE carts SET status = 'rejected', updated_at = NOW() "
+        "WHERE id = $1 AND status = 'checkout_ready'",
+        uuid.UUID(cart_id),
+    )
+    await send_telegram_message(
+        "No worries — I've set that aside and left your pantry as-is. Say the word when "
+        "you want to look again."
+    )
+
+
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 
@@ -379,6 +515,11 @@ async def telegram(request: Request) -> dict:
         data = callback.get("data", "")
         action, _, token = data.partition(":")
 
+        # "✅ I placed the order" on a staged-checkout message → record in-transit.
+        if action == "confirmed" and token:
+            await _confirm_purchase_for_cart(token)
+            return {"ok": True}
+
         if action in ("approve", "reject") and token:
             try:
                 workflow_id = await _resolve_workflow_id(token)
@@ -471,9 +612,23 @@ async def telegram(request: Request) -> dict:
     pending = await _get_pending_cart(user_id)
     if pending:
         await _handle_briefing_reply(text, pending)
-    else:
-        await _handle_fresh_request(text)
+        return {"ok": True}
 
+    # No suggestion awaiting approval — but a staged checkout might be waiting on a
+    # "did you order it?" If so, and the reply clearly confirms/denies, close that
+    # loop. Anything ambiguous falls through to normal handling (so "we're out of
+    # milk" still works while a checkout is outstanding).
+    awaiting = await _get_awaiting_confirmation_cart(user_id)
+    if awaiting:
+        decision = _classify_checkout_followup(text)
+        if decision == "confirm":
+            await _confirm_purchase_for_cart(awaiting["cart_id"])
+            return {"ok": True}
+        if decision == "deny":
+            await _mark_not_purchased_for_cart(awaiting["cart_id"], awaiting["workflow_id"])
+            return {"ok": True}
+
+    await _handle_fresh_request(text)
     return {"ok": True}
 
 
@@ -481,7 +636,8 @@ async def _send_status(user_id: str) -> None:
     """Reply with the full pantry grouped by stock level, plus any pending cart."""
     from grocery_buddy.db import get_pool
     from grocery_buddy.notifications import send_telegram_message
-    from grocery_buddy.stock import format_stock_summary, summarize_stock
+    from grocery_buddy.replenishment import get_in_transit
+    from grocery_buddy.stock import format_in_transit, format_stock_summary, summarize_stock
     from grocery_buddy.tools.schedule import describe_cadence, describe_next_run, get_schedule
 
     pool = await get_pool()
@@ -495,6 +651,9 @@ async def _send_status(user_id: str) -> None:
         buffer_days=float(prefs.get("buffer_days", 1.0)),
     )
     pantry = format_stock_summary(levels)
+
+    in_transit = await get_in_transit(pool, user_id)
+    on_the_way = format_in_transit(in_transit)
 
     pending = await _get_pending_cart(user_id)
     pending_info = _render_pending_cart(pending) if pending else "✅ No grocery list waiting"
@@ -511,6 +670,7 @@ async def _send_status(user_id: str) -> None:
 
     await send_telegram_message(
         f"{pantry}\n\n"
+        f"{(on_the_way + chr(10) + chr(10)) if on_the_way else ''}"
         f"{pending_info}\n"
         f"{sched_info}\n\n"
         f"<b>Quick commands</b>\n"
@@ -790,6 +950,23 @@ async def _apply_inventory_update(items: list[dict]) -> str:
     return ", ".join(applied)
 
 
+async def _apply_not_arrived(products: list[str]) -> list[str]:
+    """Cancel in-transit rows for items the user says didn't arrive; return their names."""
+    from grocery_buddy.db import get_pool
+    from grocery_buddy.replenishment import cancel_in_transit
+
+    user_id = settings.grocery_buddy_user_id
+    pool = await get_pool()
+    cancelled: list[str] = []
+    for product in products:
+        try:
+            rows = await cancel_in_transit(pool, user_id, product=product)
+            cancelled.extend(r["product"] for r in rows)
+        except Exception as exc:
+            logger.warning("cancel_in_transit failed for %r: %s", product, exc)
+    return cancelled
+
+
 async def _handle_briefing_reply(text: str, pending: dict) -> None:
     """User replied to a pending morning briefing."""
     from grocery_buddy.agents.assistant import parse_briefing_reply
@@ -975,6 +1152,18 @@ async def _handle_fresh_request(text: str) -> None:
         else:
             await send_telegram_message(
                 "I couldn't update that — mind naming the item and how much you have?"
+            )
+    elif intent["action"] == "report_not_arrived":
+        cancelled = await _apply_not_arrived(intent.get("items", []))
+        if cancelled:
+            await send_telegram_message(
+                f"Got it — took {', '.join(cancelled)} off your on-the-way list. "
+                "I'll factor those back into your next grocery list."
+            )
+        else:
+            await send_telegram_message(
+                "I didn't have those marked as on the way, so nothing changed. If you're "
+                "out of something, tell me (e.g. <i>\"we're out of milk\"</i>) and I'll fix it."
             )
     elif intent["action"] == "update_schedule":
         await _apply_schedule_update(intent)
