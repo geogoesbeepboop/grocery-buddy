@@ -192,18 +192,22 @@ async def advance_onboarding(
     The transcript is kept JSON-serializable so callers can persist it between
     stateless webhook calls.
     """
+    client = llm.get_client()
+
     while True:
         # Onboarding is structured intake (parse a free-form pantry dump into tool
         # calls) — well within Haiku's reach, and much cheaper than Sonnet.
-        response = await llm.create_message(
+        # _SYSTEM and _TOOLS are byte-stable, so a cache breakpoint on the last
+        # message replays the whole growing prefix (tools+system+transcript) once
+        # it clears Haiku's 4096-token floor on the later turns.
+        response = await client.messages.create(
             model=settings.model_fast,
-            label="advance_onboarding",
-            user_id=user_id,
             max_tokens=2048,
             system=_SYSTEM,
             tools=_TOOLS,
-            messages=messages,
+            messages=llm.with_transcript_cache(messages),
         )
+        llm.record_usage(settings.model_fast, response.usage, label="onboarding")
         messages.append({"role": "assistant", "content": _serialize_blocks(response.content)})
 
         if response.stop_reason == "tool_use":

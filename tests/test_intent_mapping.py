@@ -1,12 +1,12 @@
 """Deterministic tests for the intent-parsing CODE path (model mocked).
 
 These assert the tool_use → action-dict mapping in assistant.py without any network
-call: we patch grocery_buddy.llm.create_message to return canned content blocks. This
-is the cheap, every-commit safety net; prompt *quality* is covered by evals/ instead.
+call: we patch the shared client's ``messages.create`` to return canned content
+blocks. This is the cheap, every-commit safety net; prompt *quality* is covered by
+evals/ instead.
 """
 import types
 
-from grocery_buddy import llm
 from grocery_buddy.agents import assistant
 
 
@@ -18,11 +18,20 @@ def _text(t):
     return types.SimpleNamespace(type="text", text=t)
 
 
-def _patch(monkeypatch, blocks):
-    async def fake_create(**kwargs):
-        return types.SimpleNamespace(content=blocks)
+def _fake_client(blocks):
+    class _Messages:
+        async def create(self, **kwargs):
+            # usage=None → record_usage() no-ops (no pricing/ledger in unit tests).
+            return types.SimpleNamespace(content=blocks, usage=None)
 
-    monkeypatch.setattr(llm, "create_message", fake_create)
+    class _Client:
+        messages = _Messages()
+
+    return _Client()
+
+
+def _patch(monkeypatch, blocks):
+    monkeypatch.setattr(assistant.llm, "get_client", lambda: _fake_client(blocks))
 
 
 # ── parse_request (no pending cart) ───────────────────────────────────────────

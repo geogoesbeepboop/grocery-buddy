@@ -18,6 +18,7 @@ from grocery_buddy.notifications import (
     send_arrival_notification,
     send_briefing,
     send_checkout_link,
+    send_selector_health_alert,
     send_telegram_message,
 )
 from grocery_buddy.predictor import (
@@ -41,6 +42,23 @@ def _wf_id() -> str | None:
         return activity.info().workflow_id
     except Exception:
         return None
+
+
+async def _flush_selector_health(report, context: str) -> None:
+    """Score Langfuse and (if any selector broke or self-healed) page the user.
+
+    ``summarize_health`` emits the Langfuse score as a side effect regardless, so we
+    always call it; only the Telegram alert is gated by ``SELECTOR_HEALTH_ALERTS``.
+    Best-effort — selector observability must never fail a real run.
+    """
+    try:
+        from grocery_buddy.automation.resilience import summarize_health
+
+        summary = summarize_health(report)
+        if summary and settings.selector_health_alerts:
+            await send_selector_health_alert(summary)
+    except Exception as exc:
+        logger.warning("Selector-health flush failed (%s)", exc)
 
 
 # ── User-facing notices (so a run never ends in silence) ──────────────────────
@@ -329,6 +347,7 @@ async def lookup_amazon_prices(payload: dict) -> list[dict]:
     that product (``brand_prefs[product] = {preferred_brand, brand_flexibility}``).
     """
     from grocery_buddy.automation.amazon import get_browser_context, search_grocery_price
+    from grocery_buddy.automation.resilience import health_run
     from grocery_buddy.products import normalize_product
 
     items = payload["items"]
@@ -351,47 +370,49 @@ async def lookup_amazon_prices(payload: dict) -> list[dict]:
 
     p, context = await get_browser_context()
     priced: list[dict] = []
-    try:
-        for item in items:
-            candidates = await search_grocery_price(item["product"], context)
-            if not candidates:
-                logger.warning("No Amazon results for %r — skipping", item["product"])
-                continue
+    with health_run("pricing") as health:
+        try:
+            for item in items:
+                candidates = await search_grocery_price(item["product"], context)
+                if not candidates:
+                    logger.warning("No Amazon results for %r — skipping", item["product"])
+                    continue
 
-            pref = brand_prefs.get(normalize_product(item["product"]), {})
-            # Attribute the brand-pick LLM cost to this run for the cost alert.
-            with run_scope(_wf_id(), payload.get("user_id")):
-                chosen, reason = await _select_candidate_by_brand(
-                    product=item["product"],
-                    candidates=candidates,
-                    preferred_brand=pref.get("preferred_brand"),
-                    brand_flexibility=pref.get("brand_flexibility", "any"),
-                )
-            if chosen is None:
-                logger.info("Brand-strict match unavailable for %r — skipping", item["product"])
-                continue
+                pref = brand_prefs.get(normalize_product(item["product"]), {})
+                # Attribute the brand-pick LLM cost to this run for the cost alert.
+                with run_scope(_wf_id(), payload.get("user_id")):
+                    chosen, reason = await _select_candidate_by_brand(
+                        product=item["product"],
+                        candidates=candidates,
+                        preferred_brand=pref.get("preferred_brand"),
+                        brand_flexibility=pref.get("brand_flexibility", "any"),
+                    )
+                if chosen is None:
+                    logger.info("Brand-strict match unavailable for %r — skipping", item["product"])
+                    continue
 
-            logger.info("Selected %r for %r (%s)", chosen["product"], item["product"], reason)
-            priced.append({
-                "product": item["product"],
-                "qty": item["par_level"],  # buy up to par
-                "unit": item["unit"],
-                "price_usd": chosen["price_usd"],
-                "price_source": "amazon_scraped",
-                "asin": chosen.get("asin"),
-                "kroger_sku": None,
-                # The actual Amazon listing we'd buy — this is what the user sees in
-                # the briefing (the brand/variant matters, not just "milk").
-                "notes": chosen["product"],
-                # Carried through for the free-shipping assembler: which lines are
-                # must-buys vs. fillers, and how soon each runs out.
-                "tier": item.get("tier", "must_buy"),
-                "days_remaining": item.get("days_remaining"),
-            })
-    finally:
-        await context.close()
-        await p.stop()
+                logger.info("Selected %r for %r (%s)", chosen["product"], item["product"], reason)
+                priced.append({
+                    "product": item["product"],
+                    "qty": item["par_level"],  # buy up to par
+                    "unit": item["unit"],
+                    "price_usd": chosen["price_usd"],
+                    "price_source": "amazon_scraped",
+                    "asin": chosen.get("asin"),
+                    "kroger_sku": None,
+                    # The actual Amazon listing we'd buy — this is what the user sees in
+                    # the briefing (the brand/variant matters, not just "milk").
+                    "notes": chosen["product"],
+                    # Carried through for the free-shipping assembler: which lines are
+                    # must-buys vs. fillers, and how soon each runs out.
+                    "tier": item.get("tier", "must_buy"),
+                    "days_remaining": item.get("days_remaining"),
+                })
+        finally:
+            await context.close()
+            await p.stop()
 
+    await _flush_selector_health(health, "Amazon pricing")
     return priced
 
 
@@ -434,10 +455,10 @@ async def _select_candidate_by_brand(
         ),
     }.get(brand_flexibility, "Pick the cheapest reasonable match.")
 
+    client = llm.get_client()
     try:
-        resp = await llm.create_message(
+        resp = await client.messages.create(
             model=settings.model_fast,
-            label="select_candidate_by_brand",
             max_tokens=256,
             system=(
                 "You select the best grocery product listing for a shopper. "
@@ -455,6 +476,7 @@ async def _select_candidate_by_brand(
                 ),
             }],
         )
+        llm.record_usage(settings.model_fast, resp.usage, label="brand_select")
         text = "".join(b.text for b in resp.content if hasattr(b, "text")).strip()
         # Tolerate fenced/extra text around the JSON.
         m = re.search(r"\{.*\}", text, re.DOTALL)
@@ -645,6 +667,7 @@ async def prepare_checkout_activity(payload: dict) -> dict:
         add_to_cart_by_asin,
         get_browser_context,
     )
+    from grocery_buddy.automation.resilience import health_run
 
     cart_id = payload["cart_id"]
     idempotency_key = payload["idempotency_key"]
@@ -678,67 +701,71 @@ async def prepare_checkout_activity(payload: dict) -> dict:
     )
 
     p, context = await get_browser_context()
-    try:
-        # Add each item to the Amazon cart. A single item failing shouldn't sink
-        # the whole order — stage whatever we can and report it.
-        added = 0
-        for item in items:
-            asin = item["asin"]
-            if not asin:
-                logger.warning("No ASIN for %s — cannot add to cart", item["product"])
-                continue
-            if await add_to_cart_by_asin(asin, context):
-                added += 1
-            else:
-                logger.warning("Couldn't add %s (ASIN %s) to cart", item["product"], asin)
+    with health_run("checkout") as health:
+        try:
+            # Add each item to the Amazon cart. A single item failing shouldn't sink
+            # the whole order — stage whatever we can and report it.
+            added = 0
+            for item in items:
+                asin = item["asin"]
+                if not asin:
+                    logger.warning("No ASIN for %s — cannot add to cart", item["product"])
+                    continue
+                if await add_to_cart_by_asin(asin, context):
+                    added += 1
+                else:
+                    logger.warning("Couldn't add %s (ASIN %s) to cart", item["product"], asin)
 
-        if added == 0:
-            raise RuntimeError("Couldn't add any items to the Amazon cart")
+            if added == 0:
+                raise RuntimeError("Couldn't add any items to the Amazon cart")
 
-        # Hand back the account-scoped cart URL rather than driving into the
-        # session-bound /gp/buy/spc/ checkout flow: that SPC URL belongs to this
-        # Playwright session and makes the user re-authenticate (the double-auth)
-        # when opened on their phone. The cart URL resolves against their own
-        # signed-in Amazon — web or app — where these items now sit, so they land
-        # one tap from checkout without a second login.
-        checkout_url = AMAZON_CART_URL
+            # Hand back the account-scoped cart URL rather than driving into the
+            # session-bound /gp/buy/spc/ checkout flow: that SPC URL belongs to this
+            # Playwright session and makes the user re-authenticate (the double-auth)
+            # when opened on their phone. The cart URL resolves against their own
+            # signed-in Amazon — web or app — where these items now sit, so they land
+            # one tap from checkout without a second login.
+            checkout_url = AMAZON_CART_URL
 
-        total_usd = float(await pool.fetchval(
-            "SELECT total_usd FROM carts WHERE id = $1", uuid.UUID(cart_id)
-        ) or 0)
+            total_usd = float(await pool.fetchval(
+                "SELECT total_usd FROM carts WHERE id = $1", uuid.UUID(cart_id)
+            ) or 0)
 
-        await pool.execute(
-            """
-            UPDATE purchases
-            SET status = 'checkout_ready', retailer_order_ref = $2, total_usd = $3
-            WHERE id = $1
-            """,
-            uuid.UUID(purchase_id), checkout_url, round(total_usd, 2),
-        )
-        await pool.execute(
-            "UPDATE carts SET status = 'checkout_ready', updated_at = NOW() WHERE id = $1",
-            uuid.UUID(cart_id),
-        )
+            await pool.execute(
+                """
+                UPDATE purchases
+                SET status = 'checkout_ready', retailer_order_ref = $2, total_usd = $3
+                WHERE id = $1
+                """,
+                uuid.UUID(purchase_id), checkout_url, round(total_usd, 2),
+            )
+            await pool.execute(
+                "UPDATE carts SET status = 'checkout_ready', updated_at = NOW() WHERE id = $1",
+                uuid.UUID(cart_id),
+            )
 
-        await send_checkout_link(cart_id, total_usd, checkout_url)
-        logger.info("Checkout staged for cart %s (%d items) → %s", cart_id, added, checkout_url)
-        return {"status": "checkout_ready", "idempotency_key": idempotency_key, "total_usd": total_usd}
+            await send_checkout_link(cart_id, total_usd, checkout_url)
+            logger.info("Checkout staged for cart %s (%d items) → %s", cart_id, added, checkout_url)
+            return {"status": "checkout_ready", "idempotency_key": idempotency_key, "total_usd": total_usd}
 
-    except Exception as exc:
-        await pool.execute(
-            "UPDATE purchases SET status = 'failed', error = $2 WHERE id = $1",
-            uuid.UUID(purchase_id), str(exc),
-        )
-        await pool.execute(
-            "UPDATE carts SET status = 'failed', updated_at = NOW() WHERE id = $1",
-            uuid.UUID(cart_id),
-        )
-        # Re-raise — the workflow's top-level handler sends the single user-facing
-        # "something went wrong" message (avoids double-notifying + leaking detail).
-        raise
-    finally:
-        await context.close()
-        await p.stop()
+        except Exception as exc:
+            await pool.execute(
+                "UPDATE purchases SET status = 'failed', error = $2 WHERE id = $1",
+                uuid.UUID(purchase_id), str(exc),
+            )
+            await pool.execute(
+                "UPDATE carts SET status = 'failed', updated_at = NOW() WHERE id = $1",
+                uuid.UUID(cart_id),
+            )
+            # Re-raise — the workflow's top-level handler sends the single user-facing
+            # "something went wrong" message (avoids double-notifying + leaking detail).
+            raise
+        finally:
+            await context.close()
+            await p.stop()
+            # Flush here (not after the with-block) so a selector-breakage that made
+            # added==0 still pages the user — the failure path re-raises above.
+            await _flush_selector_health(health, "Amazon checkout")
 
 
 @activity.defn
@@ -922,6 +949,7 @@ async def scrape_amazon_orders_activity(user_id: str) -> list[dict]:
     import shutil
 
     from grocery_buddy.automation.amazon import get_scraper_context, scrape_order_history
+    from grocery_buddy.automation.resilience import health_run
 
     search_name = (settings.amazon_account_first_name or "").strip() or None
     if not search_name:
@@ -931,17 +959,20 @@ async def scrape_amazon_orders_activity(user_id: str) -> list[dict]:
         )
 
     pw, context, temp_dir = await get_scraper_context()
-    try:
-        return await scrape_order_history(
-            context,
-            search_name=search_name,
-            max_pages=settings.amazon_import_max_pages,
-            max_orders=settings.amazon_import_max_orders,
-        )
-    finally:
-        await context.close()
-        await pw.stop()
-        shutil.rmtree(str(temp_dir), ignore_errors=True)
+    with health_run("import") as health:
+        try:
+            orders = await scrape_order_history(
+                context,
+                search_name=search_name,
+                max_pages=settings.amazon_import_max_pages,
+                max_orders=settings.amazon_import_max_orders,
+            )
+        finally:
+            await context.close()
+            await pw.stop()
+            shutil.rmtree(str(temp_dir), ignore_errors=True)
+    await _flush_selector_health(health, "Amazon order import")
+    return orders
 
 
 @activity.defn

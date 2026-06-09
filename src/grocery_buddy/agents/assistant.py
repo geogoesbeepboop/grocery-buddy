@@ -355,17 +355,24 @@ def _fallback_briefing(items: list[dict], total_usd: float, reason: str | None) 
 async def compose_briefing(
     items: list[dict], total_usd: float, reason: str | None = None
 ) -> str:
-    """Write a warm, natural grocery-approval message (Telegram HTML).
+    """Write the grocery-approval message (Telegram HTML).
 
-    Grounded on exact item names/prices so it can't drift — the model gets the
-    rendered facts and must reuse them. Falls back to a deterministic render on any
-    error or if the model drops the total, so the briefing always goes out.
+    The deterministic render (`_render_briefing_lines` + `_fallback_briefing`) is
+    already exact and hallucination-proof, so we only spend a Haiku call when there
+    is prose worth writing: a ``reason`` note explaining why the cart looks the way
+    it does (e.g. extra items added to clear the free-shipping minimum). With no
+    such note the deterministic render IS the answer — paying Haiku to reword item
+    lines we'd only validate back against that same render is pure waste. On any
+    error, or if the model drops the exact total, we fall back to the deterministic
+    render so the briefing always goes out.
     """
-    if not items:
+    # No items, or no note to phrase as prose → ship the exact deterministic
+    # render and skip the LLM entirely (the common, no-fillers path).
+    if not items or not (reason and reason.strip()):
         return _fallback_briefing(items, total_usd, reason)
 
     facts = "\n".join(_render_briefing_lines(items))
-    context = f"Context for this run: {reason}\n" if reason else ""
+    context = f"Context for this run: {reason}\n"
     system = (
         f"{PERSONA}\n\n"
         "You're texting the user their grocery list for approval — warm and natural, like "
@@ -389,13 +396,13 @@ async def compose_briefing(
     )
 
     try:
-        resp = await llm.create_message(
+        resp = await llm.get_client().messages.create(
             model=settings.model_fast,
-            label="compose_briefing",
             max_tokens=600,
             system=system,
             messages=[{"role": "user", "content": user}],
         )
+        llm.record_usage(settings.model_fast, resp.usage, label="briefing")
         text = "".join(b.text for b in resp.content if hasattr(b, "text")).strip()
         # Guard against drift: the exact total must survive.
         if text and f"{total_usd:.2f}" in text:
@@ -421,6 +428,7 @@ async def parse_request(message: str, stock_summary: str | None = None) -> dict:
       {"action": "update_schedule", "cron": str, "timezone": str, "description": str}
       {"action": "chat", "reply": str}
     """
+    client = llm.get_client()
     pantry_context = (
         f"\n\nThe user's current pantry snapshot (you CAN see this — use it to answer "
         f"stock questions and to decide what's low):\n{stock_summary}\n"
@@ -448,14 +456,14 @@ async def parse_request(message: str, stock_summary: str | None = None) -> dict:
         "purchase or a run on a guess."
         f"{pantry_context}"
     )
-    response = await llm.create_message(
+    response = await client.messages.create(
         model=settings.model_fast,
-        label="parse_request",
         max_tokens=512,
         system=system,
         tools=_FRESH_TOOLS,
         messages=[{"role": "user", "content": message}],
     )
+    llm.record_usage(settings.model_fast, response.usage, label="parse_request")
     for block in response.content:
         if getattr(block, "type", None) != "tool_use":
             continue
@@ -521,8 +529,8 @@ async def parse_briefing_reply(message: str, cart_items: list[dict]) -> dict:
     system = (
         f"{PERSONA}\n\n"
         "The user just received their grocery briefing and replied. Interpret their reply "
-        "in the context of the pending cart shown below, and call the right tool.\n\n"
-        f"Pending cart (${total:.2f} total):\n{cart_lines}\n\n"
+        "in the context of the pending cart provided in the user message, and call the "
+        "right tool.\n\n"
         "The guiding rule (least friction): if the user NAMES specific items to buy, "
         "they want a brand-new cart of just those items — call buy_items and the pending "
         "suggestion is set aside. Only an explicit approval of the pending list checks it "
@@ -545,14 +553,23 @@ async def parse_briefing_reply(message: str, cart_items: list[dict]) -> dict:
         "gone). Prefer this over reject when they state a real on-hand amount.\n"
         "• update_schedule — change when/how often the briefing runs."
     )
-    response = await llm.create_message(
-        model=settings.model_fast,
-        label="parse_briefing_reply",
-        max_tokens=512,
-        system=system,
-        tools=_BRIEFING_TOOLS,
-        messages=[{"role": "user", "content": message}],
+    # Cart + reply ride the user turn so the system+tools prefix stays byte-stable
+    # (the cart used to live in the system prompt, which rewrote the prefix on every
+    # briefing — cache-hostile). cacheable_system marks it; below Haiku's 4096-token
+    # floor this no-ops today, but the stable structure is the prerequisite to ever
+    # caching here.
+    user = (
+        f"Pending cart (${total:.2f} total):\n{cart_lines}\n\n"
+        f"The user's reply: {message}"
     )
+    response = await llm.get_client().messages.create(
+        model=settings.model_fast,
+        max_tokens=512,
+        system=llm.cacheable_system(system),
+        tools=_BRIEFING_TOOLS,
+        messages=[{"role": "user", "content": user}],
+    )
+    llm.record_usage(settings.model_fast, response.usage, label="briefing_reply")
 
     for block in response.content:
         if getattr(block, "type", None) != "tool_use":
