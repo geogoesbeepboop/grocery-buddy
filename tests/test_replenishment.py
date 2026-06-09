@@ -7,7 +7,7 @@ Covers the pure pieces that hold the feature together:
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from grocery_buddy.predictor import (
     ConsumptionProfile,
@@ -21,15 +21,15 @@ from grocery_buddy.stock import format_in_transit
 
 class TestEtaFor:
     def test_adds_lead_time(self):
-        ordered = datetime(2026, 6, 5, 12, 0, tzinfo=timezone.utc)
+        ordered = datetime(2026, 6, 5, 12, 0, tzinfo=UTC)
         assert eta_for(ordered, 2.0) == ordered + timedelta(days=2)
 
     def test_fractional_lead_time(self):
-        ordered = datetime(2026, 6, 5, 0, 0, tzinfo=timezone.utc)
+        ordered = datetime(2026, 6, 5, 0, 0, tzinfo=UTC)
         assert eta_for(ordered, 1.5) == ordered + timedelta(days=1, hours=12)
 
     def test_negative_lead_time_clamped_to_now(self):
-        ordered = datetime(2026, 6, 5, tzinfo=timezone.utc)
+        ordered = datetime(2026, 6, 5, tzinfo=UTC)
         assert eta_for(ordered, -3.0) == ordered
 
 
@@ -82,14 +82,14 @@ class TestFormatInTransit:
         assert format_in_transit([]) == ""
 
     def test_renders_items_with_eta(self):
-        eta = datetime.now(timezone.utc) + timedelta(days=1)
+        eta = datetime.now(UTC) + timedelta(days=1)
         out = format_in_transit([{"product": "eggs", "qty": 12, "unit": "count", "eta": eta}])
         assert "On the way" in out
         assert "eggs" in out
         assert "tomorrow" in out
 
     def test_quantity_and_unit_shown(self):
-        eta = datetime.now(timezone.utc) + timedelta(days=3)
+        eta = datetime.now(UTC) + timedelta(days=3)
         out = format_in_transit([{"product": "milk", "qty": 2, "unit": "gallon", "eta": eta}])
         assert "milk" in out
         assert "2 gallon" in out

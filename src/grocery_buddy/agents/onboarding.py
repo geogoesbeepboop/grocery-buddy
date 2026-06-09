@@ -7,8 +7,7 @@ from __future__ import annotations
 
 import logging
 
-import anthropic
-
+from grocery_buddy import llm
 from grocery_buddy.config import settings
 from grocery_buddy.db import get_pool
 from grocery_buddy.tools.consumption import upsert_consumption_profile
@@ -193,13 +192,13 @@ async def advance_onboarding(
     The transcript is kept JSON-serializable so callers can persist it between
     stateless webhook calls.
     """
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-
     while True:
         # Onboarding is structured intake (parse a free-form pantry dump into tool
         # calls) — well within Haiku's reach, and much cheaper than Sonnet.
-        response = await client.messages.create(
+        response = await llm.create_message(
             model=settings.model_fast,
+            label="advance_onboarding",
+            user_id=user_id,
             max_tokens=2048,
             system=_SYSTEM,
             tools=_TOOLS,

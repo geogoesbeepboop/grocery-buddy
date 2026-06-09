@@ -24,7 +24,7 @@ purchase → consumption history); see docs/PROCUREMENT_CONVERGENCE.md.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import asyncpg
@@ -70,7 +70,7 @@ async def record_replenishments(
     Returns ``{already, eta, count, items: [{product, qty, unit}]}``.
     """
     cart_uuid = UUID(cart_id)
-    now = ordered_at or datetime.now(timezone.utc)
+    now = ordered_at or datetime.now(UTC)
     eta = eta_for(now, lead_time_days)
 
     async with pool.acquire() as conn:
@@ -180,7 +180,7 @@ async def reconcile_arrivals(
     Safe to call from overlapping callers — ``FOR UPDATE SKIP LOCKED`` + the status
     flip mean a row is never landed twice.
     """
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     landed: list[dict] = []
 
     async with pool.acquire() as conn:

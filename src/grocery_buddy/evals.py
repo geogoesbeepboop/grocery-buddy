@@ -1,141 +1,200 @@
-"""T16 — Langfuse evals: prediction accuracy + per-run cost alert.
+"""Evals: real prediction precision/recall (from snapshots) + per-run cost alert.
 
-Two eval loops run after each GroceryRunWorkflow completes:
-  1. prediction_accuracy  — did the predictor flag items that were actually
-                            purchased? (precision) and did it miss any that
-                            were manually added? (recall)
-  2. cost_alert          — if the Langfuse-traced per-run cost exceeds the
-                           configured threshold, fire an ntfy alert.
+prediction accuracy
+    At run time ``select_run_candidates_activity`` snapshots the predictor's decision
+    for every pantry item (``prediction_snapshots``). Here we score each snapshot
+    against what was actually purchased within ``horizon_days``:
+        precision = of the items we flagged low, how many were bought
+        recall    = of the items bought, how many we'd flagged low
+    Micro-averaged across snapshots in the lookback window. Because ``predicted``
+    comes from the snapshot (NOT from cart membership), recall is no longer pinned
+    to 1.0 — buying something we never flagged lowers it, as it should.
 
-These are called from the workflow via a post-run activity, OR can be run
-standalone against historical data:
-  uv run python -m grocery_buddy.evals --user-id <uuid>
+cost alert
+    Every LLM call records tokens + cost to the ``llm_usage`` ledger (see
+    ``grocery_buddy.llm``). A run's cost = SUM(cost_usd) for its workflow_id; if it
+    exceeds the threshold we alert. (It used to be fed a hardcoded 0.0, so the alert
+    could never fire.)
+
+Run standalone:  uv run python -m grocery_buddy.evals --user-id <uuid>
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+import uuid as uuid_mod
+from datetime import UTC, datetime, timedelta
 
+from grocery_buddy import tracing
 from grocery_buddy.config import settings
 from grocery_buddy.db import get_pool
 from grocery_buddy.notifications import send_error_notification
+from grocery_buddy.products import normalize_product
+from grocery_buddy.tools.predictions import get_recent_snapshots
 
 logger = logging.getLogger(__name__)
-
-# Cost alert threshold per run (USD). Override via env if needed.
-COST_ALERT_THRESHOLD_USD = 1.00
 
 
 # ── Prediction accuracy ───────────────────────────────────────────────────────
 
 
-async def compute_prediction_accuracy(user_id: str, lookback_days: int = 7) -> dict:
-    """
-    Precision: fraction of predicted-low items that ended up being purchased.
-    Recall:    fraction of purchased items that were predicted low beforehand.
+def prediction_metrics(predicted: set[str], relevant: set[str]) -> dict:
+    """Pure precision/recall/F1 for a single snapshot.
 
-    Uses carts + cart_items as the ground-truth "items bought" signal.
-    Uses the consumption_events (source='inferred') as proxy for predictions
-    until we store explicit prediction snapshots.
+    ``predicted`` = items the predictor flagged low.
+    ``relevant``  = items actually needed (bought) in the horizon.
+    Returns confusion counts so callers can micro-average across snapshots.
     """
+    tp = predicted & relevant
+    fp = predicted - relevant
+    fn = relevant - predicted
+    precision = len(tp) / len(predicted) if predicted else None
+    recall = len(tp) / len(relevant) if relevant else None
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if precision and recall
+        else None
+    )
+    return {
+        "tp": len(tp),
+        "fp": len(fp),
+        "fn": len(fn),
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
+
+
+def _ratio(num: int, den: int) -> float | None:
+    return (num / den) if den else None
+
+
+async def compute_prediction_accuracy(
+    user_id: str,
+    lookback_days: int | None = None,
+    horizon_days: int | None = None,
+) -> dict:
+    """Micro-averaged precision/recall over prediction snapshots vs. real purchases."""
+    lookback_days = lookback_days or settings.eval_lookback_days
+    horizon_days = horizon_days or settings.eval_horizon_days
     pool = await get_pool()
-    import uuid as uuid_mod
-
     uid = uuid_mod.UUID(user_id)
-    since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    now = datetime.now(UTC)
+    since = now - timedelta(days=lookback_days)
 
-    # Items that were purchased in this window
-    purchased_rows = await pool.fetch(
-        """
-        SELECT DISTINCT ci.product
-        FROM cart_items ci
-        JOIN carts c ON c.id = ci.cart_id
-        WHERE c.user_id = $1
-          AND c.status = 'purchased'
-          AND c.created_at >= $2
-        """,
-        uid, since,
-    )
-    purchased = {r["product"] for r in purchased_rows}
+    snapshots = await get_recent_snapshots(pool, user_id, since)
+    if not snapshots:
+        return {
+            "precision": None,
+            "recall": None,
+            "note": "no prediction snapshots in window (predictor hasn't run yet, "
+            "or runs pre-date this eval)",
+            "window_days": lookback_days,
+            "horizon_days": horizon_days,
+        }
 
-    # Items we predicted low (appeared in any draft/approved/purchased cart)
-    predicted_rows = await pool.fetch(
-        """
-        SELECT DISTINCT ci.product
-        FROM cart_items ci
-        JOIN carts c ON c.id = ci.cart_id
-        WHERE c.user_id = $1
-          AND c.created_at >= $2
-        """,
-        uid, since,
-    )
-    predicted = {r["product"] for r in predicted_rows}
-
-    if not predicted and not purchased:
-        return {"precision": None, "recall": None, "note": "no data in window"}
-
-    true_positives = predicted & purchased
-    precision = len(true_positives) / len(predicted) if predicted else None
-    recall = len(true_positives) / len(purchased) if purchased else None
+    tp_total = fp_total = fn_total = 0
+    snapshots_scored = 0
+    for snap in snapshots:
+        predicted = {
+            normalize_product(p["product"])
+            for p in snap["predicted"]
+            if p.get("flagged_low")
+        }
+        window_start = snap["created_at"]
+        window_end = window_start + timedelta(days=horizon_days)
+        purchased_rows = await pool.fetch(
+            """
+            SELECT DISTINCT ci.product
+            FROM cart_items ci
+            JOIN carts c ON c.id = ci.cart_id
+            WHERE c.user_id = $1
+              AND c.status = 'purchased'
+              AND c.created_at >= $2
+              AND c.created_at <  $3
+            """,
+            uid,
+            window_start,
+            window_end,
+        )
+        relevant = {normalize_product(r["product"]) for r in purchased_rows}
+        if not predicted and not relevant:
+            continue
+        m = prediction_metrics(predicted, relevant)
+        tp_total += m["tp"]
+        fp_total += m["fp"]
+        fn_total += m["fn"]
+        snapshots_scored += 1
 
     result = {
-        "precision": round(precision, 3) if precision is not None else None,
-        "recall": round(recall, 3) if recall is not None else None,
-        "predicted_count": len(predicted),
-        "purchased_count": len(purchased),
-        "true_positive_count": len(true_positives),
+        "precision": (
+            round(_ratio(tp_total, tp_total + fp_total), 3)
+            if (tp_total + fp_total)
+            else None
+        ),
+        "recall": (
+            round(_ratio(tp_total, tp_total + fn_total), 3)
+            if (tp_total + fn_total)
+            else None
+        ),
+        "true_positives": tp_total,
+        "false_positives": fp_total,
+        "false_negatives": fn_total,
+        "snapshots_scored": snapshots_scored,
         "window_days": lookback_days,
+        "horizon_days": horizon_days,
     }
     logger.info("Prediction accuracy for %s: %s", user_id, result)
     return result
 
 
-def _emit_to_langfuse(score_name: str, value: float, user_id: str, metadata: dict) -> None:
-    """Send a numeric score to Langfuse (no-op if unconfigured)."""
-    if not (settings.langfuse_public_key and settings.langfuse_secret_key):
-        return
-    try:
-        from langfuse import Langfuse  # type: ignore[import]
-        lf = Langfuse(
-            public_key=settings.langfuse_public_key,
-            secret_key=settings.langfuse_secret_key,
-            host=settings.langfuse_host,
-        )
-        lf.score(
-            name=score_name,
-            value=value,
-            comment=str(metadata),
-        )
-        lf.flush()
-    except Exception as exc:
-        logger.warning("Langfuse score emit failed: %s", exc)
+# ── Per-run LLM cost ──────────────────────────────────────────────────────────
+
+
+async def sum_run_cost(workflow_id: str | None) -> float:
+    """Total LLM cost (USD) recorded for a Temporal run, from the llm_usage ledger."""
+    if not workflow_id:
+        return 0.0
+    pool = await get_pool()
+    val = await pool.fetchval(
+        "SELECT COALESCE(SUM(cost_usd), 0) FROM llm_usage WHERE workflow_id = $1",
+        workflow_id,
+    )
+    return float(val or 0.0)
+
+
+# ── Aggregate runner + cost alert ─────────────────────────────────────────────
 
 
 async def run_evals(user_id: str) -> dict:
-    """Run all evals for a user and emit scores to Langfuse."""
+    """Run all evals for a user and emit scores to Langfuse (best-effort)."""
     results: dict = {}
-
-    # Prediction accuracy
     accuracy = await compute_prediction_accuracy(user_id)
     results["prediction_accuracy"] = accuracy
     if accuracy.get("precision") is not None:
-        _emit_to_langfuse("prediction_precision", accuracy["precision"], user_id, accuracy)
+        tracing.record_score(
+            name="prediction_precision",
+            value=accuracy["precision"],
+            user_id=user_id,
+            comment=str(accuracy),
+        )
     if accuracy.get("recall") is not None:
-        _emit_to_langfuse("prediction_recall", accuracy["recall"], user_id, accuracy)
-
+        tracing.record_score(
+            name="prediction_recall",
+            value=accuracy["recall"],
+            user_id=user_id,
+            comment=str(accuracy),
+        )
     return results
 
 
-# ── Cost alert ────────────────────────────────────────────────────────────────
-
-
 async def check_cost_alert(run_cost_usd: float, user_id: str) -> None:
-    """Fire an ntfy alert if a single run's cost exceeds the threshold."""
-    if run_cost_usd > COST_ALERT_THRESHOLD_USD:
+    """Fire an alert if a single run's cost exceeds the configured threshold."""
+    threshold = settings.cost_alert_threshold_usd
+    if run_cost_usd > threshold:
         msg = (
-            f"Run cost ${run_cost_usd:.3f} exceeded alert threshold "
-            f"${COST_ALERT_THRESHOLD_USD:.2f} for user {user_id[:8]}"
+            f"Run cost ${run_cost_usd:.4f} exceeded alert threshold "
+            f"${threshold:.2f} for user {user_id[:8]}"
         )
         logger.warning(msg)
         await send_error_notification(f"⚠️ Cost alert: {msg}")
@@ -156,6 +215,7 @@ async def _main(user_id: str) -> None:
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser(description="Run grocery-buddy evals")
     parser.add_argument("--user-id", required=True)
     args = parser.parse_args()

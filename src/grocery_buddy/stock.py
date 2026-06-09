@@ -6,7 +6,7 @@ prediction math the grocery run uses so the two never disagree.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import asyncpg
 
@@ -149,9 +149,8 @@ def format_stock_summary(levels: list[StockLevel]) -> str:
 
 def _eta_phrase(eta: datetime) -> str:
     """Friendly relative ETA: 'today', 'tomorrow', 'in N days', else a short date."""
-    from datetime import timezone
 
-    now = datetime.now(eta.tzinfo or timezone.utc)
+    now = datetime.now(eta.tzinfo or UTC)
     days = (eta.date() - now.date()).days
     if days <= 0:
         return "expected today"

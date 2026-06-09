@@ -40,11 +40,13 @@ def run(user_id: str) -> None:
 
 
 async def _run_workflow(user_id: str) -> None:
+    import uuid
+
     from temporalio.client import Client
+
     from grocery_buddy.config import settings
     from grocery_buddy.models import GroceryRunInput
     from grocery_buddy.workflows.grocery_run import GroceryRunWorkflow
-    import uuid
 
     client = await Client.connect(settings.temporal_host, namespace=settings.temporal_namespace)
     handle = await client.start_workflow(
@@ -133,6 +135,7 @@ async def _ask(user_id: str, message: str) -> None:
 def webhook(port: int) -> None:
     """Start the webhook server (receives Telegram messages and button callbacks)."""
     import uvicorn
+
     from grocery_buddy.webhook import app
     uvicorn.run(app, host="0.0.0.0", port=port)
 
@@ -147,8 +150,13 @@ def schedule(user_id: str, cron: str, tz: str) -> None:
 
 
 async def _create_schedule(user_id: str, cron: str, tz: str) -> None:
-    from temporalio.client import Client, Schedule, ScheduleActionStartWorkflow, ScheduleSpec
-    from temporalio.client import ScheduleCalendarSpec
+    from temporalio.client import (
+        Client,
+        Schedule,
+        ScheduleActionStartWorkflow,
+        ScheduleSpec,
+    )
+
     from grocery_buddy.config import settings
     from grocery_buddy.models import GroceryRunInput
     from grocery_buddy.workflows.grocery_run import GroceryRunWorkflow
@@ -178,8 +186,9 @@ async def _create_schedule(user_id: str, cron: str, tz: str) -> None:
     click.echo(f"Schedule created: {schedule_id} ({cron} UTC, display timezone: {tz})")
 
     # Persist to DB
-    from grocery_buddy.db import get_pool
     import uuid as uuid_mod
+
+    from grocery_buddy.db import get_pool
     pool = await get_pool()
     await pool.execute(
         """
@@ -217,3 +226,36 @@ async def _run_evals(user_id: str) -> None:
     for key, val in results.items():
         click.echo(f"  {key}: {val}")
     click.echo()
+
+
+@main.command(name="scraper-health")
+def scraper_health() -> None:
+    """Probe Amazon extraction (price + ASIN) and alert on regression."""
+    asyncio.run(_scraper_health())
+
+
+async def _scraper_health() -> None:
+    from grocery_buddy.monitoring import check_scraper_health
+    res = await check_scraper_health()
+    click.echo(f"\nScraper health: {res['status'].upper()}")
+    for c in res["checked"]:
+        mark = "✅" if c["ok"] else "❌"
+        click.echo(f"  {mark} {c['query']}: {c['candidates']} candidates")
+    if res["detail"]:
+        click.echo(f"  detail: {res['detail']}")
+
+
+@main.command()
+@click.option("--user-id", required=True, help="User UUID")
+def gate(user_id: str) -> None:
+    """Show the money-live readiness gate (every condition must pass to go live)."""
+    asyncio.run(_gate(user_id))
+
+
+async def _gate(user_id: str) -> None:
+    from grocery_buddy.gating import money_live_ready
+    res = await money_live_ready(user_id)
+    click.echo(f"\nmoney_live_ready: {res['ready']}")
+    for name, cond in res["conditions"].items():
+        mark = "✅" if cond["pass"] else "❌"
+        click.echo(f"  {mark} {name}: {cond['detail']}")

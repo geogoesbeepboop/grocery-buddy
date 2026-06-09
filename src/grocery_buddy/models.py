@@ -6,7 +6,6 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
-
 # ── Error-type sentinels (shared activity ↔ workflow, hence in this passed-through
 #    module) ─────────────────────────────────────────────────────────────────────
 

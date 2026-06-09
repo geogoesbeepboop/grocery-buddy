@@ -1,0 +1,31 @@
+name: Nightly model evals
+
+# The prompt-regression tier (evals/) makes paid, nondeterministic model calls, so it
+# runs nightly (and on demand) rather than per-commit. The harness exits 0 with a skip
+# message if ANTHROPIC_API_KEY is absent, so a missing secret never red-X's the run.
+
+on:
+  schedule:
+    - cron: "0 7 * * *"   # 07:00 UTC daily
+  workflow_dispatch: {}
+
+jobs:
+  model-evals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run model-accuracy evals (gating suites must clear the threshold)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+        run: uv run python -m evals.run --threshold 0.8 --verbose

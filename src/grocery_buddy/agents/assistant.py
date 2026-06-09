@@ -19,8 +19,7 @@ from __future__ import annotations
 
 import logging
 
-import anthropic
-
+from grocery_buddy import llm
 from grocery_buddy.config import settings
 
 logger = logging.getLogger(__name__)
@@ -390,9 +389,9 @@ async def compose_briefing(
     )
 
     try:
-        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-        resp = await client.messages.create(
+        resp = await llm.create_message(
             model=settings.model_fast,
+            label="compose_briefing",
             max_tokens=600,
             system=system,
             messages=[{"role": "user", "content": user}],
@@ -422,7 +421,6 @@ async def parse_request(message: str, stock_summary: str | None = None) -> dict:
       {"action": "update_schedule", "cron": str, "timezone": str, "description": str}
       {"action": "chat", "reply": str}
     """
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
     pantry_context = (
         f"\n\nThe user's current pantry snapshot (you CAN see this — use it to answer "
         f"stock questions and to decide what's low):\n{stock_summary}\n"
@@ -450,8 +448,9 @@ async def parse_request(message: str, stock_summary: str | None = None) -> dict:
         "purchase or a run on a guess."
         f"{pantry_context}"
     )
-    response = await client.messages.create(
+    response = await llm.create_message(
         model=settings.model_fast,
+        label="parse_request",
         max_tokens=512,
         system=system,
         tools=_FRESH_TOOLS,
@@ -546,9 +545,9 @@ async def parse_briefing_reply(message: str, cart_items: list[dict]) -> dict:
         "gone). Prefer this over reject when they state a real on-hand amount.\n"
         "• update_schedule — change when/how often the briefing runs."
     )
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-    response = await client.messages.create(
+    response = await llm.create_message(
         model=settings.model_fast,
+        label="parse_briefing_reply",
         max_tokens=512,
         system=system,
         tools=_BRIEFING_TOOLS,

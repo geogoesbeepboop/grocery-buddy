@@ -18,11 +18,10 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from html import escape
 
-import anthropic
-
+from grocery_buddy import llm
 from grocery_buddy.config import settings
 from grocery_buddy.tools.imports import apply_edits, update_proposal_items
 
@@ -246,7 +245,7 @@ async def synthesize_grocery_history(orders: list[dict]) -> list[dict]:
     if not orders:
         return []
 
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(UTC).date()
     products = _aggregate_orders(orders, today)
     if not products:
         logger.warning("Order-history synthesis: no products after aggregation")
@@ -271,7 +270,7 @@ async def synthesize_grocery_history(orders: list[dict]) -> list[dict]:
     max_tokens = _synthesis_token_budget(len(products))
 
     try:
-        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        client = llm.get_client()
         # Stream the response: a large max_tokens generation can run past the
         # non-streaming request window, and the stream helper assembles the final
         # tool_use block for us regardless of how long the proposal gets.
@@ -284,6 +283,8 @@ async def synthesize_grocery_history(orders: list[dict]) -> list[dict]:
             messages=[{"role": "user", "content": user}],
         ) as stream:
             resp = await stream.get_final_message()
+        # Record tokens/cost for the streaming call (create_message can't wrap a stream).
+        await llm.record_usage(settings.model_smart, resp.usage, "synthesize_grocery_history")
     except Exception as exc:
         logger.warning("Order-history synthesis failed: %s", exc)
         return []
@@ -575,11 +576,11 @@ async def advance_import_review(
     one of 'continue' | 'confirm' | 'cancel'. Edits are persisted to the staged
     proposal as they happen; the caller writes to the live pantry only on 'confirm'.
     """
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-
     while True:
-        resp = await client.messages.create(
+        resp = await llm.create_message(
             model=settings.model_fast,
+            label="advance_import_review",
+            user_id=user_id,
             max_tokens=1500,
             system=_review_system(items),
             tools=_REVIEW_TOOLS,
