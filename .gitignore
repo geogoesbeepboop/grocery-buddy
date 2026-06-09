@@ -46,3 +46,7 @@ node_modules/
 /blob-report/
 /playwright/.cache/
 /playwright/.auth/
+
+# Claude Code — per-user local overrides (the shared config is committed:
+# .claude/settings.json, skills/, agents/, hooks/)
+.claude/settings.local.json
