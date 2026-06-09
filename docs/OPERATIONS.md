@@ -18,7 +18,7 @@ uv run grocery-buddy webhook --port 8080
 ngrok http 8080
 ```
 
-Use `make dev` to get a checklist of what to start.
+Or use the dev launcher: `./scripts/dev.sh up` brings up the stack and `./scripts/dev.sh restart` reloads it after a code change (`make dev` / `make restart` wrap these).
 
 ---
 
@@ -59,6 +59,20 @@ uv run grocery-buddy schedule --user-id <uuid> --cron "0 13 * * *"
 ```bash
 uv run grocery-buddy evals --user-id <uuid>
 ```
+
+### Check scraper health (catch silent Amazon-selector breakage)
+```bash
+uv run grocery-buddy scraper-health
+```
+Probes Amazon search for known staples and asserts a price + ASIN still extract; pages
+you on a regression. Good to run on a schedule. See [EVALS.md](EVALS.md).
+
+### Check the money-live readiness gate
+```bash
+uv run grocery-buddy gate --user-id <uuid>
+```
+Prints each money-live precondition and whether it passes. `checkout_verified` is a hard
+stop today, so the gate cannot pass — by design. See [EVALS.md](EVALS.md).
 
 ### View recent carts
 ```sql
@@ -222,7 +236,8 @@ Update `TEMPORAL_HOST` to point to your production Temporal endpoint.
 - `prepare_checkout_activity` runs with `maximum_attempts=1` (NO_RETRY) and is idempotent on `idempotency_key`, so re-staging never double-adds
 
 ### Cost spike alert fired
-- Default threshold is `$1.00/run` in `evals.py`
-- Check Langfuse for which model calls were expensive
+- Default threshold is `$1.00/run` (`cost_alert_threshold_usd` in `config.py`); the run's
+  cost is summed from the `llm_usage` ledger (`evals.sum_run_cost`)
+- Check Langfuse — or `SELECT label, model, cost_usd FROM llm_usage WHERE workflow_id = '<wf>' ORDER BY cost_usd DESC` — for which model calls were expensive
 - Amazon price lookup (many products + vision calls) is the main driver
-- Adjust `COST_ALERT_THRESHOLD_USD` in `evals.py` to your comfort level
+- Adjust by setting `COST_ALERT_THRESHOLD_USD=<value>` in `.env` (no code change needed)

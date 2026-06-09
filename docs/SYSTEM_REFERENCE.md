@@ -207,6 +207,16 @@ Configured in `config.py`; two tiers.
 Rule of thumb: Haiku for routing/extraction/chat; Sonnet only where messy
 real-world data must become a clean structured proposal.
 
+**Every call goes through `grocery_buddy.llm`** — the single Anthropic entry point.
+`create_message(...)` uses one process-wide shared `AsyncAnthropic` client (keeps
+httpx's connection pool), and `record_usage()` prices the response, feeds the Langfuse
+trace, and (fire-and-forget) writes a row to the `llm_usage` cost ledger. Helpers:
+`cacheable_system` / `with_transcript_cache` add prompt-cache breakpoints respecting
+Haiku's 4096-token cacheable floor (they pay off on the onboarding/import loops and
+no-op elsewhere); `run_scope(workflow_id, user_id)` tags every call made inside a
+Temporal run so `evals.sum_run_cost(workflow_id)` can total a run's spend. Never call
+the Anthropic SDK directly and never hardcode a model id.
+
 ---
 
 ## 3. Agentic loops (Claude tool-use)
@@ -369,16 +379,16 @@ All I/O lives here; workflows stay pure.
 | `apply_estimated_depletion_activity` | Decay on-hand estimates by assumed use since last reconcile |
 | `load_user_data` | Load inventory, profiles, events, prefs, **incoming** (in-transit) map + guardrail signals |
 | `predict_low_items_activity` | Run the rule-based predictor → low items |
-| `select_run_candidates_activity` | Split into must-buy (low now) + fillers (soonest-due mediums) to clear free shipping; returns `threshold_usd`, `max_fillers` |
+| `select_run_candidates_activity` | Split into must-buy (low now) + fillers (soonest-due mediums) to clear free shipping; returns `threshold_usd`, `max_fillers`. Also writes a `prediction_snapshots` row (what the predictor decided) for the accuracy eval |
 | `lookup_amazon_prices` | Playwright search + brand-aware candidate selection (Haiku) |
 | `lookup_kroger_prices` | Kroger public Products API (price comparison; inert without a token) |
 | `assemble_run_cart_activity` | Trim priced candidates → final cart: every must-buy + only enough fillers to clear free shipping; returns `reason` |
 | `build_draft_cart` | Write `carts` + `cart_items`, stamp `workflow_id` |
 | `send_approval_notification` | Compose + send the briefing for approval |
 | `update_cart_status` | Flip cart status |
-| `prepare_checkout_activity` | Stage Amazon cart by ASIN, mark `checkout_ready`, return checkout link (idempotent on `idempotency_key`; never purchases) |
+| `prepare_checkout_activity` | Clear the existing cart, then stage by ASIN, mark `checkout_ready`, return checkout link (clear-first prevents cross-run accumulation; idempotent on `idempotency_key`; never purchases) |
 | `send_checkout_link_activity` | (Re)send a checkout link |
-| `run_evals_activity` | Prediction precision/recall → Langfuse; cost alert |
+| `run_evals_activity` | Prediction precision/recall from `prediction_snapshots` → Langfuse; cost alert from the run's summed `llm_usage` (see EVALS.md) |
 | `ensure_amazon_login_activity` | Self-heal the Amazon session (credential fill or interactive window) + relay 2FA over Telegram; non-retryable login-required error on failure (§10) |
 | `scrape_amazon_orders_activity` | Scrape order history (profile-scoped search) |
 | `synthesize_pantry_from_orders_activity` | Sonnet synthesis wrapper |
@@ -403,6 +413,7 @@ See §3 — these are the `tools=[...]` handed to each Claude call. They are the
 | `tools/imports.py` | `create_import_proposal`, `get_active_import_proposal`, `update_proposal_items`, `set_proposal_status`, `apply_edits` (pure) |
 | `tools/schedule.py` | `upsert_schedule`, `get_schedule`, `next_run_utc`, `describe_next_run`, `describe_cadence` |
 | `tools/auth.py` | 2FA relay mailbox: `create_otp_challenge`, `submit_otp_code`, `read_answered_code`, `expire_challenge` (backs the `amazon_auth_challenges` table, §10) |
+| `tools/predictions.py` | `record_prediction_snapshot`, `get_recent_snapshots` (writes/reads `prediction_snapshots`, backing the accuracy eval) |
 | `tools/reset.py` | `clear_user_data` (the `/clear` testing reset) |
 
 ### 5.3 MCP server tools (`mcp_server.py`) — FastMCP, for local dev with Claude Code
@@ -519,7 +530,9 @@ manual / onboarding triggers bypass both guardrails (always run, always report)
 `users`, `inventory_items`, `consumption_profile`, `consumption_events`,
 `pending_replenishments`, `preferences`, `carts`, `cart_items`, `purchases`,
 `approvals`, `price_snapshots`, `schedules`, `amazon_profiles`, `conversation_state`,
-`import_proposals`, `amazon_auth_challenges` (16 tables, migrations `001`–`009`).
+`import_proposals`, `amazon_auth_challenges`, `prediction_snapshots` (predictor-decision
+log for the accuracy eval), `llm_usage` (per-call cost ledger) — 18 tables, migrations
+`001`–`011`.
 
 Conversation modes (`conversation_state.mode`): `idle`, `onboarding`,
 `import_review`, `amazon_2fa` (set while relaying a one-time code, §10).
@@ -537,7 +550,9 @@ In-transit statuses (`pending_replenishments.status`): `in_transit → {arrived 
 - **Inbound:** `webhook.py` `/telegram` (messages + button callbacks: approve / reject
   / confirmed), `/health`.
 - **CLI** (`cli.py`): `onboard`, `worker`, `run`, `webhook`, `schedule`, `evals`,
-  `mcp`, `ask` (drives `parse_request` from the terminal).
+  `mcp`, `ask` (drives `parse_request` from the terminal), `scraper-health` (run the
+  synthetic Amazon-selector probe, §11), `gate --user-id` (print the money-live
+  readiness gate, see EVALS.md).
 - **Scripts:** `scripts/setup_amazon_session.py` (save a login interactively),
   `scripts/debug_order_scrape.py` (run just the order scrape and print JSON),
   `scripts/seed_user.py` (create a user + preferences row).
@@ -578,3 +593,56 @@ passkey prompt falls back to the password+code flow we can actually drive.
 
 **Relevant config** (`config.py`): `amazon_email`, `amazon_password`,
 `amazon_profile_name`, `amazon_headless`, `amazon_login_wait_seconds`.
+
+---
+
+## 11. Automation resilience & money-live gate
+
+Amazon pins the automation to its internal CSS ids; a redesign breaks them **silently**
+(a renamed class returns `[]`, swallowed at `logger.warning`), so pricing/import quietly
+under-deliver. Three layers turn that silent failure into a fast deterministic path, a
+self-healing fallback, and an alert.
+
+**`automation/resilience.py` — self-healing, observable element resolution.**
+- `Strategy` descriptors (`css` / `role` / `text` / `label` …) + `build_locator` let one
+  intent carry a chain of CSS ids **and** role/ARIA fallbacks (accessible names churn far
+  less than ids). `first_matching` tries the chain and returns the first hit — the
+  deterministic fast path.
+- `resolve(intent, ...)` is `first_matching` for a *critical* intent, instrumented:
+  hit/miss is recorded to the run's `SelectorHealthReport`, and on a **total 0-match** it
+  falls back to LLM **repair** — asks a model (`selector_repair_model`, default Sonnet)
+  over the page's accessibility tree (vision only if `selector_repair_vision`) which
+  element matches, validates the answer, **caches** the rediscovered descriptor
+  (`selector_cache_path`), and uses it. Repair runs **only** on a 0-match, so the hot path
+  stays deterministic. `summarize_health` flags a critical 0-match and emits Langfuse
+  scores. Repair never runs on the add-to-cart click — reads only.
+
+**`automation/network.py` — interception over scraping.**
+- `block_heavy_resources` aborts images/media/fonts + ad/telemetry beacons (Amazon pages
+  never go idle otherwise). Applied to **read paths only** (search, order scrape) — never
+  sign-in or add-to-cart, where a blocked captcha image or suppressed telemetry could
+  break auth or look bot-like on the money path.
+- `confirm_add_to_cart` treats Amazon's own cart-mutation XHR (JSON) as the success
+  signal, far more stable than waiting on one of seven overlay CSS ids.
+- `JsonResponseCollector` opportunistically captures JSON XHR bodies — a hedge/diagnostic
+  for if/when the server-rendered pages move to client-rendered JSON.
+
+**`monitoring.py` — synthetic scraper health.** `check_scraper_health()` searches known
+staples and asserts a price + ASIN still extract; on regression it pages the user so
+churn surfaces on first break, not after a week of empty runs. Run via
+`grocery-buddy scraper-health` (cron / Temporal schedule / ad-hoc). It is also a
+precondition of the money-live gate.
+
+**`gating.py` — money-live readiness gate.** `money_live_ready(user_id)` is the hard stop
+for any future auto-buy path: it only returns `ready=True` when every condition passes —
+both flags on (`auto_buy_enabled` **and** `money_live`), predictor precision ≥
+`gate_predictor_precision_floor`, run cost ≤ `gate_run_cost_ceiling_usd`, scraper green,
+and `checkout_verified` (a deliberate hard stop until staged-cart execution is verified).
+Inspect it with `grocery-buddy gate --user-id <id>`. The conditions are outputs of the
+eval layer — see **[EVALS.md](EVALS.md)**.
+
+**Relevant config** (`config.py`): `amazon_block_heavy_resources`, `selector_cache_path`,
+`selector_repair_enabled`, `selector_repair_vision`, `selector_repair_model`,
+`selector_health_alerts`; `auto_buy_enabled`, `money_live`,
+`gate_predictor_precision_floor`, `gate_run_cost_ceiling_usd`,
+`cost_alert_threshold_usd`, `eval_lookback_days`, `eval_horizon_days`.
