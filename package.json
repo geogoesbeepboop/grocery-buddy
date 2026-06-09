@@ -19,9 +19,5 @@
   "bugs": {
     "url": "https://github.com/geogoesbeepboop/grocery-buddy/issues"
   },
-  "homepage": "https://github.com/geogoesbeepboop/grocery-buddy#readme",
-  "devDependencies": {
-    "@playwright/test": "^1.60.0",
-    "@types/node": "^25.9.1"
-  }
+  "homepage": "https://github.com/geogoesbeepboop/grocery-buddy#readme"
 }

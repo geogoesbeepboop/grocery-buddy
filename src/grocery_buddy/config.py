@@ -101,5 +101,32 @@ class Settings(BaseSettings):
     # a positive number to pin an explicit ceiling (capped at Sonnet's max output).
     amazon_import_synthesis_max_tokens: int = 0
 
+    # ── Browser-automation resilience ─────────────────────────────────────────
+    # Amazon pins us to its internal CSS ids; a redesign breaks them silently. These
+    # control the self-healing/observability layer (see automation/resilience.py,
+    # automation/network.py).
+    #
+    # Abort image/media/font + ad/telemetry requests on the read paths (search,
+    # order scrape). Fixes the "Amazon pages never go idle" problem and speeds loads.
+    # Never applied to sign-in or add-to-cart. Disable if a future change relies on
+    # blocked content.
+    amazon_block_heavy_resources: bool = True
+    # Where the self-heal layer persists selectors it rediscovered. Lives OUTSIDE the
+    # browser profile (which the scraper copies/wipes) so a healed selector survives.
+    selector_cache_path: str = ".selector-cache.json"
+    # On a deterministic 0-match, ask an LLM over the accessibility tree to relocate
+    # the element, then cache the answer. Only ever runs on a 0-match, so the hot
+    # path stays deterministic. Turn off to fail fast instead of self-healing.
+    selector_repair_enabled: bool = True
+    # Attach a screenshot to the repair prompt (vision) as a last resort. Costs more
+    # per repair; the accessibility tree alone is usually enough. Off by default.
+    selector_repair_vision: bool = False
+    # Model for selector repair. Blank → MODEL_SMART (Sonnet); repair benefits from a
+    # stronger model since it reasons over a whole accessibility tree.
+    selector_repair_model: str = ""
+    # Page the user (Telegram) when a make-or-break selector matches 0 across a whole
+    # run — turning the old silent "couldn't pull from Amazon" into an actionable alert.
+    selector_health_alerts: bool = True
+
 
 settings = Settings()
