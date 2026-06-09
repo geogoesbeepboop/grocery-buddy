@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Awaitable, Callable
 
 from playwright.async_api import BrowserContext, Locator, Page
@@ -145,15 +146,38 @@ async def _fill_verified(page: Page, locator: Locator, value: str, label: str,
     return False
 
 
-async def _click_and_settle(page: Page, selectors, label: str) -> bool:
+async def _click_role_button(page: Page, name_patterns: tuple[str, ...]) -> bool:
+    """Click a button/link by ARIA accessible name. Amazon's advance buttons are
+    ``<input type=submit>`` whose value ("Continue"/"Sign in") is their accessible
+    name — and names churn far less than the element ids, so this is the fallback
+    when every id variant misses. Best-effort."""
+    for pat in name_patterns:
+        rx = re.compile(pat, re.I)
+        for role_name in ("button", "link"):
+            try:
+                el = page.get_by_role(role_name, name=rx).first
+                if await el.count() and await el.is_visible():
+                    await el.click(timeout=8_000)
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+async def _click_and_settle(page: Page, selectors, label: str,
+                            *, role_names: tuple[str, ...] = ()) -> bool:
     """Click the first matching advance button, then wait for the page to react.
 
     Amazon's email→password and password→next transitions can be a full
     navigation OR an in-place re-render, so we wait for ``domcontentloaded`` (best
     effort) plus a short settle so the next step's fields exist before the loop
-    re-detects. Returns True if a button was actually clicked.
+    re-detects. Tries the id variants first, then an ARIA-name fallback. Returns
+    True if a button was actually clicked.
     """
-    if not await _click_first(page, selectors):
+    clicked = await _click_first(page, selectors)
+    if not clicked and role_names:
+        clicked = await _click_role_button(page, role_names)
+    if not clicked:
         logger.debug("Login: no %s button found (%s)", label, selectors)
         return False
     try:
@@ -255,7 +279,8 @@ async def _handle_otp_step(page: Page, get_otp: Callable[[], Awaitable[str | Non
     otp_field = page.locator(_OTP_SEL).first
     if not await _fill_verified(page, otp_field, code, "2FA code", timeout=8_000):
         return False
-    await _click_and_settle(page, _SIGNIN_SEL, "verify-code")
+    await _click_and_settle(page, _SIGNIN_SEL, "verify-code",
+                            role_names=(r"sign[\s-]*in", "verify", "submit"))
     return True
 
 
@@ -334,7 +359,8 @@ async def login_with_credentials(
                 if not await _fill_verified(page, password_field, password, "password"):
                     continue  # field vanished mid-write (page moved) — re-detect
                 await _check_if_present(page, "#rememberMe, input[name='rememberMe']")
-                await _click_and_settle(page, _SIGNIN_SEL, "sign-in")
+                await _click_and_settle(page, _SIGNIN_SEL, "sign-in",
+                                        role_names=(r"sign[\s-]*in",))
                 # Rejected outright? Don't resubmit a bad password in a loop.
                 if await _is_visible(password_field) and (err := await _auth_error(page)):
                     logger.warning("Amazon rejected the password: %s", err)
@@ -345,7 +371,8 @@ async def login_with_credentials(
             if email_vis:
                 if not await _fill_verified(page, email_field, email, "email"):
                     continue
-                await _click_and_settle(page, _CONTINUE_SEL, "continue")
+                await _click_and_settle(page, _CONTINUE_SEL, "continue",
+                                        role_names=("continue",))
                 if await _is_visible(email_field) and (err := await _auth_error(page)):
                     logger.warning("Amazon rejected the email: %s", err)
                     return False
