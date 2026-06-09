@@ -521,6 +521,128 @@ async def get_cart_total(context: BrowserContext) -> float | None:
         await page.close()
 
 
+# Active-cart line items and their per-item Delete controls. Amazon's cart markup
+# has churned across redesigns, so we union the stable variants. _CART_ITEM_CSS is
+# kept to plain CSS (no Playwright :has-text/:not pseudo-classes) so the exact same
+# string can be reused inside a querySelectorAll wait below.
+_CART_ITEM_CSS = (
+    "#sc-active-cart div.sc-list-item, "
+    "form#activeCartViewForm div.sc-list-item, "
+    "div[data-name='Active Cart'] div.sc-list-item, "
+    "div.sc-list-item[data-asin]"
+)
+# Delete control INSIDE a line item — targeted specifically so we never click
+# "Save for later" (which only moves an item, leaving it to resurface later).
+_CART_DELETE_SELECTORS = (
+    "[data-feature-id='item-delete-button'] input",
+    "input[data-feature-id='item-delete-button']",
+    "span.sc-action-delete input",
+    "input[value='Delete']",
+    "input[name^='submit.delete']",
+    "[aria-label='Delete']",
+)
+# Safety cap on the delete loop so an unexpected layout can never spin forever.
+_CLEAR_CART_MAX_ITERATIONS = 40
+_CLEAR_CART_DELETE_WAIT_MS = 8_000
+
+
+async def _count_cart_items(page: Page) -> int:
+    """Count line items in the ACTIVE Amazon cart (0 means empty)."""
+    try:
+        return await page.locator(_CART_ITEM_CSS).count()
+    except Exception:
+        return 0
+
+
+async def clear_cart(context: BrowserContext) -> bool:
+    """Empty the live Amazon cart, removing every active line item.
+
+    The Amazon cart is real, persistent, account-scoped state: it survives across
+    staged checkouts and is shared with the user's own shopping. Checkout staging
+    must start from an empty cart so the staged cart is EXACTLY this run's approved
+    items — otherwise a previously staged-but-unbought run, or leftovers from a
+    crashed earlier attempt, stack on top and the user can over-order.
+
+    Removes items one at a time (clicking each row's Delete control and waiting for
+    the cart to shrink) until none remain. Returns True iff the cart is empty when
+    we finish — including the already-empty case — and False if items still remain
+    after a best effort, so a caller can refuse to stage onto an uncertain cart.
+
+    NOTE: this clears the WHOLE active cart, including anything the user added
+    manually — the agent treats the Amazon cart as its own staging area.
+    """
+    page = await context.new_page()
+    try:
+        await page.goto(AMAZON_CART_URL, timeout=20_000)
+        await page.wait_for_load_state("domcontentloaded")
+
+        remaining = await _count_cart_items(page)
+        if remaining == 0:
+            return True  # already empty — nothing to clear, no health event
+
+        for _ in range(_CLEAR_CART_MAX_ITERATIONS):
+            if remaining == 0:
+                R.observe("cart.clear", matched=1, critical=True, note="emptied")
+                return True
+
+            # Scope the Delete control to the first active item so we can't pick up
+            # a Delete that belongs to "Saved for later" or some other section. We
+            # resolve deterministically and pass NO describe — like add-to-cart we
+            # never let an LLM free-pick what to click on the money path.
+            item = page.locator(_CART_ITEM_CSS).first
+            delete_btn = await R.first_matching(
+                item, [R.css(s) for s in _CART_DELETE_SELECTORS]
+            )
+            if delete_btn is None:
+                R.observe("cart.clear", matched=0, critical=True,
+                          note=f"{remaining} item(s) but no Delete control")
+                logger.warning(
+                    "clear_cart: %d item(s) but no Delete control found — stopping",
+                    remaining,
+                )
+                return False
+            try:
+                await delete_btn.first.click(timeout=10_000)
+            except Exception as exc:
+                R.observe("cart.clear", matched=0, critical=True, note="delete click failed")
+                logger.warning("clear_cart: delete click failed (%s)", exc)
+                return False
+
+            # Removing an item either reloads the cart (classic layout) or reflows
+            # it in place (smart cart). Wait for the line-item count to actually
+            # drop — handles both, and avoids the networkidle wait that never
+            # settles on Amazon's telemetry-heavy pages.
+            try:
+                await page.wait_for_function(
+                    "({n, sel}) => document.querySelectorAll(sel).length < n",
+                    arg={"n": remaining, "sel": _CART_ITEM_CSS},
+                    timeout=_CLEAR_CART_DELETE_WAIT_MS,
+                )
+            except Exception:
+                pass  # fall through; the no-progress guard below decides
+
+            new_count = await _count_cart_items(page)
+            if new_count >= remaining:
+                R.observe("cart.clear", matched=0, critical=True,
+                          note=f"no progress ({new_count} remain)")
+                logger.warning(
+                    "clear_cart: no progress (%d item(s) remain) — stopping", new_count
+                )
+                return False
+            remaining = new_count
+
+        # Exhausted the iteration cap — report the final state honestly.
+        empty = await _count_cart_items(page) == 0
+        R.observe("cart.clear", matched=1 if empty else 0, critical=True,
+                  note="hit iteration cap; " + ("empty" if empty else "items remain"))
+        return empty
+    except Exception as exc:
+        logger.warning("clear_cart failed: %s", exc)
+        return False
+    finally:
+        await page.close()
+
+
 # Note: we intentionally do not drive Amazon's "Proceed to checkout" flow. That
 # produces a /gp/buy/spc/ URL bound to this Playwright session, which forces the
 # user to re-authenticate when opened on their own device. Instead the checkout

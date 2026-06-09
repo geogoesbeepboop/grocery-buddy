@@ -665,6 +665,7 @@ async def prepare_checkout_activity(payload: dict) -> dict:
     from grocery_buddy.automation.amazon import (
         AMAZON_CART_URL,
         add_to_cart_by_asin,
+        clear_cart,
         get_browser_context,
     )
     from grocery_buddy.automation.resilience import health_run
@@ -703,6 +704,22 @@ async def prepare_checkout_activity(payload: dict) -> dict:
     p, context = await get_browser_context()
     with health_run("checkout") as health:
         try:
+            # Start from an empty Amazon cart. The cart is real, persistent,
+            # account-scoped state shared across runs (and with the user's own
+            # shopping), so without this a previously staged-but-unbought cart — or
+            # leftovers from a crashed earlier attempt under this NO_RETRY activity —
+            # would stack on top of this run's items and let the user over-order.
+            # Clearing first is also what makes the re-stage path safe for any prior
+            # purchase state that isn't 'checkout_ready' (a crashed 'pending', or a
+            # previous 'failed'/'completed'): we reconcile by clear-then-restage
+            # rather than blindly re-adding. We refuse to stage onto a cart we can't
+            # verify empty rather than risk that accumulation.
+            if not await clear_cart(context):
+                raise RuntimeError(
+                    "Couldn't empty the existing Amazon cart before staging — "
+                    "refusing to stage to avoid mixing in stale items."
+                )
+
             # Add each item to the Amazon cart. A single item failing shouldn't sink
             # the whole order — stage whatever we can and report it.
             added = 0
