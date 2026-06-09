@@ -365,7 +365,7 @@ async def _select_candidate_by_brand(
     Short-circuits the LLM when there's nothing to reason about (no preference,
     or a single candidate) to keep cost near zero on the common path.
     """
-    import anthropic
+    from grocery_buddy import llm
 
     # No preference or nothing to choose between → cheapest, no LLM call.
     if not preferred_brand or brand_flexibility == "any" or len(candidates) == 1:
@@ -386,7 +386,7 @@ async def _select_candidate_by_brand(
         ),
     }.get(brand_flexibility, "Pick the cheapest reasonable match.")
 
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    client = llm.get_client()
     try:
         resp = await client.messages.create(
             model=settings.model_fast,
@@ -407,6 +407,7 @@ async def _select_candidate_by_brand(
                 ),
             }],
         )
+        llm.record_usage(settings.model_fast, resp.usage, label="brand_select")
         text = "".join(b.text for b in resp.content if hasattr(b, "text")).strip()
         # Tolerate fenced/extra text around the JSON.
         m = re.search(r"\{.*\}", text, re.DOTALL)
