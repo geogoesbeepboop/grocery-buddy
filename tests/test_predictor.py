@@ -1,7 +1,7 @@
 """Unit tests for the rule-based predictor."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -17,7 +17,7 @@ from grocery_buddy.predictor import (
 
 
 def _event(delta: float, days_ago: int, source: str = "user_update") -> ConsumptionEvent:
-    ts = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    ts = datetime.now(UTC) - timedelta(days=days_ago)
     return ConsumptionEvent(delta=delta, ts=ts, source=source)
 
 

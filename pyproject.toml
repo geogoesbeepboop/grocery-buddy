@@ -9,7 +9,7 @@ dependencies = [
     "playwright>=1.45",
     "asyncpg>=0.29",
     "supabase>=2.0",
-    "langfuse>=2.50",
+    "langfuse>=3.0",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
     "httpx>=0.27",
@@ -46,6 +46,10 @@ src = ["src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+# Most long lines are intentional prompt / tool-description string literals; the
+# formatter governs wrapping. The substantive checks (unused imports, import order,
+# pyupgrade, pycodestyle) stay enforced in CI.
+ignore = ["E501"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

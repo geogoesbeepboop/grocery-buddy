@@ -12,6 +12,7 @@ from temporalio import activity
 
 from grocery_buddy.config import settings
 from grocery_buddy.db import get_pool
+from grocery_buddy.llm import run_scope
 from grocery_buddy.models import AMAZON_LOGIN_REQUIRED
 from grocery_buddy.notifications import (
     send_arrival_notification,
@@ -33,6 +34,14 @@ from grocery_buddy.tools.consumption import (
 from grocery_buddy.tools.inventory import get_inventory
 
 logger = logging.getLogger(__name__)
+
+
+def _wf_id() -> str | None:
+    """The current Temporal run id (for attributing LLM cost to a run), or None."""
+    try:
+        return activity.info().workflow_id
+    except Exception:
+        return None
 
 
 async def _flush_selector_health(report, context: str) -> None:
@@ -263,6 +272,43 @@ async def select_run_candidates_activity(user_data: dict) -> dict:
         incoming_by_product=user_data.get("incoming") or {},
     )
 
+    # Snapshot what the predictor decided for EVERY item (flagged-low or not) so the
+    # eval can later compare it against what was actually bought → real precision/
+    # recall. Best-effort: a telemetry failure must never block a grocery run.
+    try:
+        from grocery_buddy.predictor import LOW
+        from grocery_buddy.tools.predictions import record_prediction_snapshot
+
+        def _days(d: float | None) -> float | None:
+            if d is None or math.isinf(d) or math.isnan(d):
+                return None
+            return d
+
+        predicted = [
+            {
+                "product": lv.product,
+                "flagged_low": lv.bucket == LOW,
+                "bucket": lv.bucket,
+                "days_remaining": _days(lv.days_remaining),
+                "effective_rate": lv.effective_rate,
+                "qty": lv.qty,
+                "incoming": lv.incoming,
+            }
+            for lv in levels
+        ]
+        pool = await get_pool()
+        await record_prediction_snapshot(
+            pool,
+            user_id=user_data["user_id"],
+            workflow_id=_wf_id(),
+            run_trigger=user_data.get("trigger"),
+            predicted=predicted,
+            lead_time_days=float(user_data.get("lead_time_days", 2.0)),
+            buffer_days=float(user_data.get("buffer_days", 1.0)),
+        )
+    except Exception as exc:
+        logger.warning("Prediction snapshot skipped: %s", exc)
+
     max_fillers = int(settings.free_shipping_max_fillers)
     must_buy, fillers = split_run_candidates(levels, max_fillers)
 
@@ -333,12 +379,14 @@ async def lookup_amazon_prices(payload: dict) -> list[dict]:
                     continue
 
                 pref = brand_prefs.get(normalize_product(item["product"]), {})
-                chosen, reason = await _select_candidate_by_brand(
-                    product=item["product"],
-                    candidates=candidates,
-                    preferred_brand=pref.get("preferred_brand"),
-                    brand_flexibility=pref.get("brand_flexibility", "any"),
-                )
+                # Attribute the brand-pick LLM cost to this run for the cost alert.
+                with run_scope(_wf_id(), payload.get("user_id")):
+                    chosen, reason = await _select_candidate_by_brand(
+                        product=item["product"],
+                        candidates=candidates,
+                        preferred_brand=pref.get("preferred_brand"),
+                        brand_flexibility=pref.get("brand_flexibility", "any"),
+                    )
                 if chosen is None:
                     logger.info("Brand-strict match unavailable for %r — skipping", item["product"])
                     continue
@@ -578,13 +626,16 @@ async def send_approval_notification(payload: dict) -> None:
         uuid.UUID(cart_id),
     )
     items = [dict(r) for r in rows]
-    await send_briefing(
-        cart_id=cart_id,
-        total_usd=payload["total_usd"],
-        workflow_id=payload["workflow_id"],
-        items=items,
-        reason=payload.get("reason"),
-    )
+    # Attribute the briefing-composition LLM cost (compose_briefing, called inside
+    # send_briefing) to this run for the cost alert.
+    with run_scope(_wf_id()):
+        await send_briefing(
+            cart_id=cart_id,
+            total_usd=payload["total_usd"],
+            workflow_id=payload["workflow_id"],
+            items=items,
+            reason=payload.get("reason"),
+        )
 
 
 # ── T11/T12: Cart status + purchase ──────────────────────────────────────────
@@ -731,13 +782,18 @@ async def send_checkout_link_activity(payload: dict) -> None:
 
 @activity.defn
 async def run_evals_activity(payload: dict) -> dict:
-    """Compute prediction accuracy and emit scores to Langfuse."""
-    from grocery_buddy.evals import run_evals, check_cost_alert
+    """Compute prediction accuracy, total the run's REAL LLM cost, and alert if high."""
+    from grocery_buddy.evals import check_cost_alert, run_evals, sum_run_cost
     user_id = payload["user_id"]
-    run_cost_usd = payload.get("run_cost_usd", 0.0)
 
+    # Real per-run cost = SUM(cost_usd) of this run's llm_usage rows (was hardcoded 0.0,
+    # so the alert could never fire). run_evals_activity runs in the same workflow as
+    # the brand-pick + briefing calls, so its workflow_id matches their ledger rows.
+    run_cost_usd = await sum_run_cost(_wf_id())
     await check_cost_alert(run_cost_usd, user_id)
-    return await run_evals(user_id)
+    results = await run_evals(user_id)
+    results["run_cost_usd"] = round(run_cost_usd, 6)
+    return results
 
 
 # ── Onboarding import: re-login → scrape → synthesize → stage proposal ────────
@@ -924,7 +980,9 @@ async def synthesize_pantry_from_orders_activity(orders: list[dict]) -> list[dic
     """Sonnet synthesis: raw orders → proposed grocery/household pantry items."""
     from grocery_buddy.agents.order_history import synthesize_grocery_history
 
-    return await synthesize_grocery_history(orders)
+    # Attribute the (potentially large) Sonnet synthesis cost to the import run.
+    with run_scope(_wf_id()):
+        return await synthesize_grocery_history(orders)
 
 
 @activity.defn

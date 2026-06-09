@@ -14,8 +14,7 @@ SANDBOX RULES (Temporal Python SDK):
   - Activities are referenced by string name so their heavy deps (asyncpg,
     playwright, httpx) never get pulled into the sandbox.
 """
-import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -40,7 +39,7 @@ def _parse_eta(eta_iso: str | None) -> datetime | None:
         dt = datetime.fromisoformat(eta_iso)
     except (TypeError, ValueError):
         return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 _STANDARD_RETRY = RetryPolicy(
     initial_interval=timedelta(seconds=5),
@@ -138,6 +137,8 @@ class GroceryRunWorkflow:
             schedule_to_close_timeout=_SHORT_TIMEOUT,
             retry_policy=_STANDARD_RETRY,
         )
+        # Carry the trigger so the prediction snapshot records how the run was started.
+        user_data["trigger"] = payload.trigger
 
         # ── 1b. Guardrails ────────────────────────────────────────────────────
         # Never stack on top of a cart still awaiting approval (would create a
@@ -277,7 +278,7 @@ class GroceryRunWorkflow:
                 lambda: self._decision is not None,
                 timeout=_APPROVAL_WAIT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._decision = "expired"
 
         final_status = self._decision or "expired"
@@ -298,7 +299,7 @@ class GroceryRunWorkflow:
             )
             await workflow.execute_activity(
                 "run_evals_activity",
-                {"user_id": user_id, "run_cost_usd": 0.0},
+                {"user_id": user_id},
                 schedule_to_close_timeout=_SHORT_TIMEOUT,
                 retry_policy=_STANDARD_RETRY,
             )
@@ -340,7 +341,7 @@ class GroceryRunWorkflow:
                 lambda: self._purchase_decision is not None,
                 timeout=_CONFIRM_WAIT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             workflow.logger.info("No confirmation for cart %s — leaving checkout_ready", cart_id)
             return GroceryRunResult(status="checkout_ready", cart_id=cart_id)
 

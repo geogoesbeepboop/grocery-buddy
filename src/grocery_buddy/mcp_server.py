@@ -6,13 +6,11 @@ In production the same logic in tools/ is called directly by workflow activities
 """
 from __future__ import annotations
 
-import asyncio
 import json
 
 from mcp.server.fastmcp import FastMCP
 
-from grocery_buddy.config import settings
-from grocery_buddy.db import close_pool, get_pool
+from grocery_buddy.db import get_pool
 from grocery_buddy.tools.consumption import (
     get_consumption_profile,
     get_recent_consumption_events,

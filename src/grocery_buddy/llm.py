@@ -1,28 +1,32 @@
-"""Shared Anthropic client + token/cost telemetry + caching helpers.
+"""Shared Anthropic client + token/cost telemetry + caching helpers + run attribution.
 
-Three jobs, one module, because they're entangled:
+Four entangled jobs, one module:
 
-1. **One process-wide client.** Every call-site used to build a fresh
-   ``AsyncAnthropic`` per call, which threw away httpx's connection pool (and its
-   kept-alive TLS connections) on every request. ``get_client()`` hands back a
-   single shared client so pooling actually works.
+1. **One process-wide client.** Building a fresh ``AsyncAnthropic`` per call threw
+   away httpx's connection pool (and a TLS handshake) every request. ``get_client()``
+   hands back a single shared client.
 
-2. **The only token/cost telemetry in the system.** None of the call-sites read
-   ``response.usage`` — so cost and cache-hit rate were invisible, which made
-   every other "efficiency" change unmeasurable. ``record_usage()`` is the single
-   place that prices a response, logs tokens + cost + cache-hit rate, and feeds
-   the Langfuse trace (``tracing.log_generation``, previously dead code).
+2. **Token/cost telemetry.** ``record_usage()`` is the one place that prices a
+   response, logs tokens + cost + cache-hit rate, feeds the Langfuse trace, and
+   (best-effort, fire-and-forget) writes a row to the ``llm_usage`` ledger — the
+   authoritative per-run cost record that powers the cost alert.
 
-3. **Caching helpers that respect the floor.** Haiku won't cache a prefix under
-   4096 tokens, so naive ``cache_control`` silently no-ops on most calls. The
-   helpers here are built for the one place it pays — the multi-turn
-   onboarding/import loops, whose replayed transcript clears the floor on later
-   turns — and no-op harmlessly everywhere else.
+3. **Caching helpers** (``cacheable_system`` / ``with_transcript_cache``) that respect
+   Haiku's 4096-token cacheable floor — they pay off on the multi-turn onboarding/
+   import loops and no-op harmlessly everywhere else.
+
+4. **Run attribution.** ``run_scope(workflow_id, user_id)`` tags every LLM call made
+   inside it — even deep ones like ``compose_briefing`` — with the Temporal run, so
+   ``evals.sum_run_cost(workflow_id)`` can total a run's spend.
 """
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import logging
+import uuid as _uuid
 from dataclasses import dataclass
+from typing import Any
 
 import anthropic
 
@@ -40,16 +44,44 @@ _client: anthropic.AsyncAnthropic | None = None
 
 
 def get_client() -> anthropic.AsyncAnthropic:
-    """The process-wide ``AsyncAnthropic``.
-
-    Reused across every call-site so httpx keeps one connection pool alive for the
-    life of the process. Constructing a client per call (the old pattern) dropped
-    the pool — and paid a fresh TLS handshake — on every single request.
-    """
+    """The process-wide ``AsyncAnthropic`` (reused so httpx keeps one connection pool)."""
     global _client
     if _client is None:
         _client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
     return _client
+
+
+# ── Run attribution (workflow_id + user, for the cost ledger) ─────────────────
+
+_run_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("gb_run_id", default=None)
+_run_user: contextvars.ContextVar[str | None] = contextvars.ContextVar("gb_run_user", default=None)
+
+
+class run_scope:
+    """Tag every LLM call made inside this scope with a run id (+ optional user).
+
+    Usage inside a Temporal activity::
+
+        with run_scope(activity.info().workflow_id, user_id):
+            ...  # brand pick / briefing / synthesis costs attribute to this run
+    """
+
+    def __init__(self, run_id: str | None, user_id: str | None = None) -> None:
+        self._run_id = run_id
+        self._user_id = user_id
+        self._t_run: Any = None
+        self._t_user: Any = None
+
+    def __enter__(self) -> run_scope:
+        self._t_run = _run_id.set(self._run_id)
+        self._t_user = _run_user.set(self._user_id)
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        if self._t_run is not None:
+            _run_id.reset(self._t_run)
+        if self._t_user is not None:
+            _run_user.reset(self._t_user)
 
 
 # ── Pricing + cost ────────────────────────────────────────────────────────────
@@ -109,12 +141,76 @@ def cost_usd(model: str, usage) -> float:
     ) / 1_000_000
 
 
-def record_usage(model: str, usage, *, label: str) -> float:
-    """Price one response, log it, feed the Langfuse trace. Returns cost in USD.
+# ── Usage recording (logs + Langfuse + best-effort cost ledger) ───────────────
 
-    Call this at EVERY Anthropic call-site — it is the system's only token/cost
-    telemetry. ``label`` names the call-site in the log line. Safe to call with
-    ``usage=None`` (no-op); never raises, so telemetry can't break a real call.
+# Strong refs to fire-and-forget ledger tasks so they aren't GC'd mid-flight.
+_ledger_tasks: set[asyncio.Task] = set()
+
+
+def _uuid_or_none(uid: str | None) -> Any:
+    if not uid:
+        return None
+    try:
+        return _uuid.UUID(str(uid))
+    except (ValueError, TypeError):
+        return None
+
+
+async def _persist_ledger(
+    model: str, fields: dict[str, int], cost: float, label: str, uid, run_id: str | None
+) -> None:
+    """Write one ``llm_usage`` row. Best-effort — never raises into the caller."""
+    try:
+        from grocery_buddy.db import get_pool
+
+        pool = await get_pool()
+        await pool.execute(
+            """
+            INSERT INTO llm_usage
+                (user_id, workflow_id, label, model,
+                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            """,
+            _uuid_or_none(uid),
+            run_id,
+            label,
+            model,
+            fields["input_tokens"],
+            fields["output_tokens"],
+            fields["cache_read_input_tokens"],
+            fields["cache_creation_input_tokens"],
+            round(cost, 6),
+        )
+    except Exception as exc:
+        logger.debug("llm_usage ledger insert skipped (%s)", exc)
+
+
+def _schedule_ledger(model: str, fields: dict[str, int], cost: float, label: str) -> None:
+    """Fire-and-forget the ledger write on the running loop, tagged with run_scope.
+
+    Skipped when no DB is configured or there's no running event loop (e.g. a sync
+    unit test), so ``record_usage`` stays a pure synchronous cost function there.
+    """
+    if not settings.database_url:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(
+        _persist_ledger(model, fields, cost, label, _run_user.get(), _run_id.get())
+    )
+    _ledger_tasks.add(task)
+    task.add_done_callback(_ledger_tasks.discard)
+
+
+def record_usage(model: str, usage, *, label: str, user_id: str | None = None) -> float:
+    """Price one response, log it, feed Langfuse + the cost ledger. Returns cost (USD).
+
+    Call this at EVERY Anthropic call-site — it is the system's token/cost telemetry.
+    Synchronous and safe with ``usage=None`` (no-op); never raises, so telemetry can't
+    break a real request. The ledger write is fire-and-forget (best-effort), attributed
+    to the active ``run_scope`` when there is one.
     """
     if usage is None:
         return 0.0
@@ -125,33 +221,48 @@ def record_usage(model: str, usage, *, label: str) -> float:
     cache_read = _field(usage, "cache_read_input_tokens")
     cost = cost_usd(model, usage)
 
-    # Cache-hit rate = cached reads / all input tokens that went through the cache
-    # tiers + full-price input. Zero across repeated same-prefix calls means a
-    # silent invalidator (or a prefix below the cacheable floor).
     total_in = inp + cache_write + cache_read
     hit_rate = (cache_read / total_in) if total_in else 0.0
-
     logger.info(
-        "llm %s model=%s in=%d cache_write=%d cache_read=%d out=%d "
-        "cache_hit=%.0f%% cost=$%.5f",
+        "llm %s model=%s in=%d cache_write=%d cache_read=%d out=%d cache_hit=%.0f%% cost=$%.5f",
         label, model, inp, cache_write, cache_read, out, hit_rate * 100, cost,
     )
 
+    fields = {
+        "input_tokens": inp,
+        "output_tokens": out,
+        "cache_creation_input_tokens": cache_write,
+        "cache_read_input_tokens": cache_read,
+    }
     try:
-        tracing.log_generation(
+        tracing.record_generation(
             model=model,
-            usage={
-                "input_tokens": inp,
-                "output_tokens": out,
-                "cache_creation_input_tokens": cache_write,
-                "cache_read_input_tokens": cache_read,
-            },
+            usage=fields,
             cost_usd=cost,
+            label=label,
+            user_id=_run_user.get(),
+            run_id=_run_id.get(),
         )
     except Exception:  # telemetry must never break the actual request
-        logger.debug("log_generation failed", exc_info=True)
+        logger.debug("record_generation failed", exc_info=True)
 
+    _schedule_ledger(model, fields, cost, label)
     return cost
+
+
+async def create_message(*, model: str, label: str, user_id: str | None = None, **kwargs: Any):
+    """``client.messages.create`` on the shared client, recording usage/cost.
+
+    Convenience wrapper used by the eval harness (``evals/``); the in-app call-sites
+    use the explicit ``get_client()`` + ``record_usage()`` pattern so they can apply
+    the caching helpers.
+    """
+    resp = await get_client().messages.create(model=model, **kwargs)
+    try:
+        record_usage(model, getattr(resp, "usage", None), label=label, user_id=user_id)
+    except Exception:
+        logger.debug("record_usage failed", exc_info=True)
+    return resp
 
 
 # ── Caching helpers ───────────────────────────────────────────────────────────
@@ -160,10 +271,9 @@ def record_usage(model: str, usage, *, label: str) -> float:
 def cacheable_system(text: str) -> list[dict]:
     """Render a (stable) system prompt as one cacheable block.
 
-    Caches tools+system together — they render before messages, so a breakpoint on
-    the last system block covers both. Only worth it when the system prompt is
-    byte-stable across calls; interpolating volatile data into it invalidates the
-    cache every turn (the bug this codebase had in the review/briefing prompts).
+    Caches tools+system together (they render before messages, so a breakpoint on the
+    last system block covers both). Only worth it when the system prompt is byte-stable
+    across calls; interpolating volatile data into it invalidates the cache every turn.
     Silently no-ops below the model's cacheable floor (4096 tokens for Haiku).
     """
     return [{"type": "text", "text": text, "cache_control": _EPHEMERAL}]
@@ -172,14 +282,10 @@ def cacheable_system(text: str) -> list[dict]:
 def with_transcript_cache(messages: list[dict]) -> list[dict]:
     """Copy of ``messages`` with one ephemeral cache breakpoint on the last block.
 
-    This is the multi-turn replay pattern: the whole prefix up to the breakpoint
-    (tools + system + every prior turn) is cached, and the next turn reads it back
-    instead of re-billing the full transcript. Non-mutating, so the persisted
-    transcript never accumulates stale breakpoints.
-
-    Below the cacheable floor this no-ops — which is exactly the early-turn
-    behavior we want. It starts paying once the replayed transcript clears the
-    floor, which is the only place caching helps these Haiku loops.
+    The multi-turn replay pattern: the whole prefix up to the breakpoint (tools +
+    system + every prior turn) is cached and read back instead of re-billed.
+    Non-mutating, so the persisted transcript never accumulates stale breakpoints.
+    No-ops below the cacheable floor — exactly the early-turn behavior we want.
     """
     if not messages:
         return messages

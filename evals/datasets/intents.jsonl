@@ -1,0 +1,22 @@
+{"message": "we need more milk", "cart_pending": false, "expected_action": "quick_buy"}
+{"message": "grab some coffee", "cart_pending": false, "expected_action": "quick_buy"}
+{"message": "order more dog food and a loaf of bread", "cart_pending": false, "expected_action": "quick_buy"}
+{"message": "get Eggland's Best eggs", "cart_pending": false, "expected_action": "quick_buy"}
+{"message": "buy what I'm low on", "cart_pending": false, "expected_action": "start_grocery_run"}
+{"message": "order everything I need", "cart_pending": false, "expected_action": "start_grocery_run"}
+{"message": "do a grocery run", "cart_pending": false, "expected_action": "start_grocery_run"}
+{"message": "we still have plenty of eggs", "cart_pending": false, "expected_action": "update_inventory"}
+{"message": "we're out of paper towels", "cart_pending": false, "expected_action": "update_inventory"}
+{"message": "the family finished the bread", "cart_pending": false, "expected_action": "update_inventory"}
+{"message": "the milk never came", "cart_pending": false, "expected_action": "report_not_arrived"}
+{"message": "cancel that coffee order, it didn't show up", "cart_pending": false, "expected_action": "report_not_arrived"}
+{"message": "change my briefing to 9am", "cart_pending": false, "expected_action": "update_schedule"}
+{"message": "run it every 6 hours", "cart_pending": false, "expected_action": "update_schedule"}
+{"message": "thanks, you're a lifesaver", "cart_pending": false, "expected_action": "chat"}
+{"message": "what am I low on right now?", "cart_pending": false, "expected_action": "chat"}
+{"message": "yes that looks good", "cart_pending": true, "cart_items": [{"product": "milk", "qty": 1, "unit": "gallon", "price_usd": 3.99}, {"product": "eggs", "qty": 1, "unit": "dozen", "price_usd": 4.49}], "expected_action": "approve"}
+{"message": "checkout my cart", "cart_pending": true, "cart_items": [{"product": "milk", "qty": 1, "unit": "gallon", "price_usd": 3.99}], "expected_action": "approve"}
+{"message": "no thanks, skip it this time", "cart_pending": true, "cart_items": [{"product": "milk", "qty": 1, "unit": "gallon", "price_usd": 3.99}], "expected_action": "reject"}
+{"message": "just get the eggs", "cart_pending": true, "cart_items": [{"product": "milk", "qty": 1, "unit": "gallon", "price_usd": 3.99}, {"product": "eggs", "qty": 1, "unit": "dozen", "price_usd": 4.49}], "expected_action": "buy_items"}
+{"message": "scrap this and rebuild the list", "cart_pending": true, "cart_items": [{"product": "milk", "qty": 1, "unit": "gallon", "price_usd": 3.99}], "expected_action": "reject_and_restart"}
+{"message": "actually we still have plenty of milk", "cart_pending": true, "cart_items": [{"product": "milk", "qty": 1, "unit": "gallon", "price_usd": 3.99}], "expected_action": "update_inventory"}

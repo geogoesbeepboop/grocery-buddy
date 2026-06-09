@@ -39,6 +39,26 @@ class Settings(BaseSettings):
     # Purchase
     auto_purchase_cap_usd: float = 50.0
 
+    # ── Evals, cost, and the money-live readiness gate ────────────────────────
+    # Per-run LLM cost (USD) above which check_cost_alert fires an alert. Now fed a
+    # REAL number summed from the llm_usage ledger (was a hardcoded 0.0).
+    cost_alert_threshold_usd: float = 1.00
+    # Prediction-accuracy eval window: snapshots from the last `lookback_days`, each
+    # scored against purchases within `horizon_days` of the snapshot.
+    eval_lookback_days: int = 14
+    eval_horizon_days: int = 7
+    # Money-live readiness gate (gating.py). The sandbox auto-buy spine is built
+    # behind these; flipping `money_live` on is only honored when every condition
+    # passes. Defaults are conservative and money stays OFF until explicitly enabled.
+    auto_buy_enabled: bool = False
+    money_live: bool = False
+    gate_predictor_precision_floor: float = 0.70
+    gate_run_cost_ceiling_usd: float = 0.50
+    # Conversation transcript cap: keep at most this many messages of the persisted
+    # per-user transcript (rolling window) so onboarding/import transcripts can't grow
+    # unbounded and get re-sent in full every webhook turn. ~20 turns.
+    conversation_max_messages: int = 40
+
     # Free next-day shipping. Amazon's Prime grocery / add-on free-shipping minimum
     # is ~$25; below it the user may pay a delivery fee. When a grocery run assembles
     # a cart under this, the agent tops it up with the items due to run out soonest

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from html import escape
 
 from grocery_buddy import llm
@@ -245,7 +245,7 @@ async def synthesize_grocery_history(orders: list[dict]) -> list[dict]:
     if not orders:
         return []
 
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(UTC).date()
     products = _aggregate_orders(orders, today)
     if not products:
         logger.warning("Order-history synthesis: no products after aggregation")

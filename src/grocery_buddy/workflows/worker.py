@@ -8,7 +8,6 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 
 from grocery_buddy.config import settings
-from grocery_buddy.db import close_pool
 from grocery_buddy.workflows.activities import (
     apply_estimated_depletion_activity,
     assemble_run_cart_activity,
