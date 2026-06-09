@@ -44,7 +44,7 @@ procurement-agent's open-mandate → settled-purchase → consumption-history li
 | Capability | grocery-buddy | procurement-agent |
 |---|---|---|
 | **Real actuation** | ✅ Amazon (Playwright): search, price, stage cart, checkout link | ⛔ ACP / Stagehand / Skyvern backends are interface-fixed **stubs** (`NotImplementedError`) |
-| **Persistence** | ✅ Supabase Postgres (15 tables, migrations) | ⛔ in-memory repos only (Postgres schema *drafted*) |
+| **Persistence** | ✅ Supabase Postgres (18 tables, migrations) | ⛔ in-memory repos only (Postgres schema *drafted*) |
 | **Conversational UX** | ✅ Telegram (intent parsing, approval, onboarding, 2FA relay) | ⛔ none (MCP tools + Slack-signal stub) |
 | **Prediction / replenishment** | ✅ rule-based predictor + estimated depletion + par levels | ✅ pure consumption-rate model (`sourcing/consumption.py`) |
 | **Approval gate** | ✅ always-on, human approves every cart | ✅ HUMAN tier parks on a durable Temporal signal |

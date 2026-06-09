@@ -32,15 +32,18 @@ auto-buy tier). All notification and chat runs over **Telegram**.
 ┌─────────────────────────────────────────────────────────────────┐
 │  DATA LAYER                                                      │
 │  Supabase Postgres (asyncpg, direct connection)                  │
-│  15 tables: users, inventory, consumption (profile + events),    │
+│  18 tables: users, inventory, consumption (profile + events),    │
 │  carts, cart_items, approvals, purchases, price_snapshots,       │
-│  schedules, import_proposals, conversation_state,                │
-│  amazon_profiles, amazon_auth_challenges                         │
+│  schedules, import_proposals, conversation_state, amazon_profiles,│
+│  amazon_auth_challenges, pending_replenishments,                 │
+│  prediction_snapshots, llm_usage                                 │
 └─────────────────────────────────────────────────────────────────┘
          ▲ observes
 ┌─────────────────────────────────────────────────────────────────┐
 │  OBSERVABILITY LAYER                                             │
-│  Langfuse — traces, per-run cost, prediction accuracy evals      │
+│  Langfuse + Postgres ledgers — traces, per-run cost (llm_usage),  │
+│  prediction precision/recall, scraper-health probe → money-live   │
+│  gate (gating.py); see EVALS.md                                  │
 └─────────────────────────────────────────────────────────────────┘
          ▲ all chat + notifications
 ┌─────────────────────────────────────────────────────────────────┐
@@ -73,6 +76,8 @@ GroceryRunWorkflow.run(user_id, trigger)
     │       fillers  = soonest-due "medium" items, to round the order up to free
     │         shipping. No must-buy → notify "well stocked" and stop (never runs
     │         on fillers alone).
+    │       also snapshots the full prediction (prediction_snapshots) so the eval
+    │         can score real precision/recall against later purchases
     │
     ├─► lookup_amazon_prices      Playwright drives the persistent Amazon session;
     │                             searches the grocery dept, extracts price + ASIN,
@@ -97,14 +102,15 @@ GroceryRunWorkflow.run(user_id, trigger)
     │
     ├─► [if approved]   update_cart_status → 'approved'
     │       prepare_checkout_activity   (NO_RETRY)
-    │           Playwright adds each ASIN to the cart, marks the cart
-    │           'checkout_ready', and returns the account cart URL — the user taps
-    │           "Place order" themselves. We NEVER complete the purchase.
+    │           Playwright clears the existing cart (so stale cross-run items never
+    │           accumulate), adds each ASIN, marks the cart 'checkout_ready', and
+    │           returns the account cart URL — the user taps "Place order" themselves.
+    │           We NEVER complete the purchase.
     │           idempotency_key = 'purchase-{cart_id}' (UNIQUE) guards re-staging.
     │
     └─► run_evals_activity
-            prediction precision/recall vs. history → Langfuse scores;
-            cost alert if run_cost_usd exceeds the threshold
+            prediction precision/recall from prediction_snapshots → Langfuse scores;
+            cost alert if the run's summed llm_usage cost exceeds the threshold
 ```
 
 `QuickBuyWorkflow` (ad-hoc "buy X now") is the same shape minus prediction (items are
@@ -119,24 +125,29 @@ given) with a tighter **6h** approval timeout. `ImportHistoryWorkflow` runs
 | `workflows/grocery_run.py` | Scheduled/manual restock workflow; approve/reject signals; 24h approval timer |
 | `workflows/quick_buy.py` | Ad-hoc "buy X now" workflow (6h approval timer) |
 | `workflows/import_history.py` | Order-history import: ensure-login → scrape → synthesize → stage proposal |
-| `workflows/activities.py` | All 18 activities — every I/O/side-effect: DB, Playwright, Telegram, evals |
+| `workflows/activities.py` | All 20 activities — every I/O/side-effect: DB, Playwright, Telegram, evals |
 | `workflows/worker.py` | Temporal worker — registers workflows + activities, runs forever |
-| `automation/amazon.py` | Playwright Amazon automation: session, price search, add-to-cart, order-history scrape |
+| `automation/amazon.py` | Playwright Amazon automation: session, price search, add-to-cart (clears cart before staging), order-history scrape |
 | `automation/amazon_auth.py` | Self-healing sign-in: verified credential fill (state machine) + interactive fallback |
+| `automation/resilience.py` | Self-healing, observable element resolution: strategy descriptors, deterministic `first_matching`, instrumented `resolve` (LLM a11y/vision repair on a 0-match, with a selector cache) + per-run health report |
+| `automation/network.py` | Network-level hardening: `block_heavy_resources` (read paths only), `confirm_add_to_cart` (cart-mutation XHR as success signal), `JsonResponseCollector` |
 | `agents/assistant.py` | Intent parsing (fresh request / briefing reply), briefing composition (Haiku) |
 | `agents/onboarding.py` | Conversational intake: seeds inventory + consumption habits |
 | `agents/order_history.py` | Sonnet synthesis of scraped orders + Haiku import-review edit loop |
 | `predictor.py` / `stock.py` / `depletion.py` | Pure-Python prediction, stock bucketing, estimated depletion (unit-tested) |
 | `runlist.py` / `products.py` | Candidate/filler selection for a run; product-name normalization |
-| `tools/*.py` | Async data-access modules (inventory, consumption, conversation, imports, schedule, auth, reset) shared by activities, agents, and MCP |
+| `tools/*.py` | Async data-access modules (inventory, consumption, conversation, imports, schedule, auth, predictions, reset) shared by activities, agents, and MCP |
+| `llm.py` | Single entry point for every Anthropic call: process-wide shared client, token/cost telemetry → the `llm_usage` ledger, prompt-cache helpers, and `run_scope` run attribution |
 | `mcp_server.py` | FastMCP server — exposes the same tools for local dev with Claude Code |
-| `notifications.py` | Telegram helper: `send_telegram_message`, `send_briefing`, `send_checkout_link` |
+| `notifications.py` | Telegram helper: `send_telegram_message`, `send_briefing`, `send_checkout_link`, scraper-health alert |
 | `webhook.py` | FastAPI server — `/telegram` (messages + button callbacks → Temporal signals), `/health` |
-| `evals.py` | Prediction precision/recall against history; cost alert |
+| `evals.py` | Prediction precision/recall from `prediction_snapshots`; per-run cost from the `llm_usage` ledger + cost alert |
+| `monitoring.py` | Synthetic scraper-health probe (`check_scraper_health`) — catches silent Amazon-selector breakage; precondition of the money-live gate |
+| `gating.py` | Money-live readiness gate (`money_live_ready`) — `checkout_verified` is a hard stop today (see EVALS.md) |
 | `tracing.py` | Langfuse context manager (no-ops gracefully if unconfigured) |
 | `config.py` | Pydantic-settings; all config from `.env` |
 | `db.py` | asyncpg connection pool singleton |
-| `cli.py` | Click CLI: onboard, worker, run, ask, webhook, schedule, mcp, evals |
+| `cli.py` | Click CLI: onboard, worker, run, ask, webhook, schedule, mcp, evals, scraper-health, gate |
 
 ## Key design decisions
 

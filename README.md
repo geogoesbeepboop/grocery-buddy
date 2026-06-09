@@ -28,7 +28,7 @@ cp .env.example .env
 docker compose up -d
 
 # 4. Apply DB migrations (after Supabase project is created)
-# Paste each migrations/*.sql file (001 → 009, in order) into the Supabase SQL editor
+# Paste each migrations/*.sql file (001 → 011, in order) into the Supabase SQL editor
 
 # 5. Save your Amazon session (run once, interactive)
 # Optional: set AMAZON_EMAIL / AMAZON_PASSWORD in .env first and the agent will
@@ -62,6 +62,8 @@ uv run grocery-buddy schedule --user-id <your-user-uuid> --cron "0 8 * * *"
 | `grocery-buddy webhook [--port 8080]` | Start approval webhook server |
 | `grocery-buddy schedule --user-id <id> --cron "0 8 * * *"` | Set daily schedule |
 | `grocery-buddy mcp` | Start MCP server (for Claude Code local dev) |
+| `grocery-buddy scraper-health` | Probe Amazon for silent selector breakage |
+| `grocery-buddy gate --user-id <id>` | Print the money-live readiness gate |
 
 ## Telegram chat
 

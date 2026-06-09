@@ -2,7 +2,7 @@
 
 **Project:** `grocery-buddy` (Supabase, `looimknbtjhvwxbpkbyc`, us-east-1)
 **Engine:** PostgreSQL 17 via asyncpg (direct connection, session pooler)
-**Migrations:** `migrations/001`–`009` (16 tables). Apply each `.sql` in order in the Supabase SQL editor.
+**Migrations:** `migrations/001`–`011` (18 tables). Apply each `.sql` in order in the Supabase SQL editor.
 
 ## Entity relationship overview
 
@@ -25,6 +25,8 @@ users
        └── pending_replenishments (1:many — one per confirmed cart line, ON DELETE SET NULL)
 
 price_snapshots               (no FK — global price cache)
+prediction_snapshots          (per-run record of what the predictor decided — scored by the accuracy eval)
+llm_usage                     (append-only per-call token/cost ledger — feeds the cost alert)
 ```
 
 ---
@@ -369,6 +371,56 @@ A timeout or a newer challenge `expires` it. See SYSTEM_REFERENCE §10.
 
 ---
 
+### `prediction_snapshots`
+Per-run record of **what the predictor decided**, so its accuracy can actually be
+measured (migration `010`). The old eval compared "items in a purchased cart" against
+"items in any cart" — a superset by construction, so recall was pinned at 1.0 and it
+couldn't measure the predictor at all. Snapshotting the decision at predict-time lets
+`evals.compute_prediction_accuracy` score real precision/recall against what was bought
+in the following horizon.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `UUID PK` | |
+| `user_id` | `UUID → users.id` | **ON DELETE CASCADE** |
+| `workflow_id` | `TEXT` | The Temporal run that produced this prediction (one snapshot per run) |
+| `run_trigger` | `TEXT` | `'schedule'` \| `'manual'` \| `'onboarding'` |
+| `predicted` | `JSONB` | Every pantry item the predictor classified: `{product, flagged_low, bucket, days_remaining, effective_rate, qty, incoming}`. The `flagged_low` (bucket == `'low'`) subset is the predicted-low set the eval scores. |
+| `lead_time_days` | `FLOAT` | Snapshot of the prefs at run time |
+| `buffer_days` | `FLOAT` | |
+| `created_at` | `TIMESTAMPTZ` | |
+
+Written once per grocery run by `select_run_candidates_activity` (via
+`tools/predictions.record_prediction_snapshot`). **Idempotent:** a partial unique index
+on `workflow_id` means a retried select-candidates activity upserts its own snapshot
+rather than writing a duplicate that would skew the micro-averaged metric.
+
+---
+
+### `llm_usage`
+Append-only per-call **cost/usage ledger** — the authoritative cost record (migration
+`011`). Before it, no call site read `response.usage` and the per-run cost alert was fed
+a hardcoded `0.0` (so it could never fire). Now every Anthropic call (via
+`grocery_buddy.llm`) writes one row with token counts and a computed USD cost; a run's
+cost = `SUM(cost_usd)` for its `workflow_id`, which `evals.sum_run_cost()` feeds into
+`check_cost_alert()`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `UUID PK` | |
+| `user_id` | `UUID` | **No FK** — an observability ledger should never block a write on a stray id |
+| `workflow_id` | `TEXT` | `NULL` for calls outside a Temporal run (e.g. the webhook's intent parse) |
+| `label` | `TEXT` | Call-site name: `parse_request`, `compose_briefing`, … |
+| `model` | `TEXT NOT NULL` | |
+| `input_tokens` | `INTEGER` | |
+| `output_tokens` | `INTEGER` | |
+| `cache_read_tokens` | `INTEGER` | Prompt-cache hits |
+| `cache_write_tokens` | `INTEGER` | Prompt-cache writes |
+| `cost_usd` | `DECIMAL(12,6)` | Computed at write time from per-model pricing |
+| `created_at` | `TIMESTAMPTZ` | |
+
+---
+
 ## Indexes
 
 | Index | Columns | Purpose |
@@ -384,6 +436,10 @@ A timeout or a newer challenge `expires` it. See SYSTEM_REFERENCE §10.
 | `idx_amazon_auth_user_status` | `amazon_auth_challenges(user_id, status, created_at DESC)` | Find the latest pending 2FA challenge |
 | `idx_pending_replen_user_status` | `pending_replenishments(user_id, status, eta)` | Incoming-stock map + due-arrival reconcile |
 | `uq_pending_replen_cart_product` | `pending_replenishments(cart_id, product) WHERE status='in_transit'` | Idempotent confirm — one in-transit set per cart |
+| `uq_prediction_snapshots_workflow` | `prediction_snapshots(workflow_id) WHERE workflow_id IS NOT NULL` | One snapshot per run (idempotent upsert) |
+| `idx_prediction_snapshots_user_created` | `prediction_snapshots(user_id, created_at DESC)` | Recent snapshots for a user |
+| `idx_llm_usage_workflow` | `llm_usage(workflow_id)` | Sum a run's cost for the cost alert |
+| `idx_llm_usage_user_created` | `llm_usage(user_id, created_at DESC)` | Cost trend per user over time |
 
 ---
 
