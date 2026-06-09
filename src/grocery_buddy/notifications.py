@@ -239,3 +239,34 @@ async def send_arrival_notification(landed: list[dict]) -> None:
 
 async def send_error_notification(message: str) -> None:
     await send_telegram_message(f"⚠️ <b>Agent error</b>\n{message}")
+
+
+async def send_selector_health_alert(summary: dict) -> None:
+    """Page the user when an Amazon selector broke (or silently self-healed).
+
+    ``summary`` comes from ``resilience.summarize_health`` —
+    ``{"context": str, "broken": [{"intent","note"}], "healed": [{"intent","note"}]}``.
+    A ``broken`` entry is a make-or-break selector that matched nothing across a whole
+    run (the old silent "couldn't pull from Amazon"); ``healed`` means a selector
+    drifted but the self-heal layer recovered it — worth knowing a redesign is underway.
+    """
+    broken = summary.get("broken") or []
+    healed = summary.get("healed") or []
+    if not broken and not healed:
+        return
+    ctx = summary.get("context") or "Amazon automation"
+    lines: list[str] = []
+    if broken:
+        lines.append(f"🔧 <b>Amazon automation needs attention</b> ({ctx})")
+        lines.append("These selectors matched <b>nothing</b> — Amazon likely changed its page:")
+        for b in broken:
+            note = f" — {b['note']}" if b.get("note") else ""
+            lines.append(f"• <code>{b['intent']}</code>{note}")
+    else:
+        lines.append(f"🩹 <b>Amazon automation self-healed</b> ({ctx})")
+    if healed:
+        lines.append("Auto-repaired (now cached) — a redesign may be rolling out:")
+        for h in healed:
+            note = f" — {h['note']}" if h.get("note") else ""
+            lines.append(f"• <code>{h['intent']}</code>{note}")
+    await send_telegram_message("\n".join(lines))

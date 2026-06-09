@@ -5,8 +5,8 @@ Blends a declared consumption rate (prior) with observed consumption events
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
 
 @dataclass
@@ -78,8 +78,8 @@ class StockLevel:
 
 def _as_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def effective_daily_rate(
@@ -92,7 +92,7 @@ def effective_daily_rate(
     if not recent_events:
         return base_rate
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     consumption_events = [
         e for e in recent_events
         if (now - _as_utc(e.ts)).days <= lookback_days

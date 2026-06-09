@@ -18,11 +18,10 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from html import escape
 
-import anthropic
-
+from grocery_buddy import llm
 from grocery_buddy.config import settings
 from grocery_buddy.tools.imports import apply_edits, update_proposal_items
 
@@ -246,7 +245,7 @@ async def synthesize_grocery_history(orders: list[dict]) -> list[dict]:
     if not orders:
         return []
 
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(UTC).date()
     products = _aggregate_orders(orders, today)
     if not products:
         logger.warning("Order-history synthesis: no products after aggregation")
@@ -271,14 +270,16 @@ async def synthesize_grocery_history(orders: list[dict]) -> list[dict]:
     max_tokens = _synthesis_token_budget(len(products))
 
     try:
-        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        client = llm.get_client()
         # Stream the response: a large max_tokens generation can run past the
         # non-streaming request window, and the stream helper assembles the final
         # tool_use block for us regardless of how long the proposal gets.
+        # _SYNTH_SYSTEM is a stable constant — caching it pays back on a retry of
+        # the same import within the TTL (the order payload itself stays uncached).
         async with client.messages.stream(
             model=settings.model_smart,  # complex parsing/synthesis → Sonnet
             max_tokens=max_tokens,
-            system=_SYNTH_SYSTEM,
+            system=llm.cacheable_system(_SYNTH_SYSTEM),
             tools=[_PROPOSE_TOOL],
             tool_choice={"type": "tool", "name": "propose_pantry"},
             messages=[{"role": "user", "content": user}],
@@ -287,6 +288,8 @@ async def synthesize_grocery_history(orders: list[dict]) -> list[dict]:
     except Exception as exc:
         logger.warning("Order-history synthesis failed: %s", exc)
         return []
+
+    llm.record_usage(settings.model_smart, resp.usage, label="import_synthesis")
 
     if resp.stop_reason == "max_tokens":
         # Truncated mid-tool-call despite the scaled budget: the JSON is likely
@@ -531,8 +534,37 @@ _REVIEW_TOOLS: list[dict] = [
 ]
 
 
-def _review_system(items: list[dict]) -> str:
-    listing = "\n".join(
+# Stable across the whole review conversation — no item data interpolated — so the
+# system+tools prefix caches once and every turn reads it back. The volatile item
+# list rides a trailing context block instead (see ``_items_context``); baking it
+# in here is what made the old prompt cache-hostile (every edit rewrote the prefix).
+_REVIEW_SYSTEM = (
+    "You are Grocery Buddy helping the user review a pantry list we synthesized "
+    "from their Amazon order history, BEFORE saving anything. Nothing is in their "
+    "pantry yet — your edits change this staged proposal only.\n\n"
+    "The current proposed items are provided to you each turn in a reference block "
+    "(reflecting every edit so far).\n\n"
+    "Interpret the user's reply and call the right tool(s):\n"
+    "• remove_items — drop items. For a category like 'remove unhealthy snacks' or "
+    "'I'm on a diet, cut the junk', YOU decide which listed items qualify (chips, "
+    "candy, soda, cookies, donuts, ice cream, etc.) and remove all of them.\n"
+    "• update_item — adjust quantity, rate, brand, or unit for an item.\n"
+    "• add_item — add something they mention that's missing.\n"
+    "• show_full_list — they want to see every proposed item, not the summary.\n"
+    "• confirm_import — they're happy; save the list.\n"
+    "• cancel_import — they want to discard the whole thing.\n\n"
+    "They were shown a SUMMARY (counts + what looks low), not every item — but the "
+    "reference block holds the full list, so answer questions about any category "
+    "directly. Only call show_full_list when they ask for the entire list.\n\n"
+    "You may call several tools in one turn (e.g. remove three snacks at once). "
+    "After editing, briefly tell the user what you changed and what remains, and "
+    "ask if it looks good now. Match product names to the reference list exactly. Be "
+    "warm and concise. Telegram HTML only (<b>, <i>); no markdown."
+)
+
+
+def _items_listing(items: list[dict]) -> str:
+    return "\n".join(
         f"- {it['product']}"
         + (f" [{it['preferred_brand']}]" if it.get("preferred_brand") else "")
         + f" — have ~{it.get('estimated_qty', 0):g} {it.get('unit', '')}".rstrip()
@@ -540,29 +572,21 @@ def _review_system(items: list[dict]) -> str:
         + f" ({it.get('category', 'other')})"
         for it in items
     ) or "(the list is now empty)"
-    return (
-        "You are Grocery Buddy helping the user review a pantry list we synthesized "
-        "from their Amazon order history, BEFORE saving anything. Nothing is in their "
-        "pantry yet — your edits change this staged proposal only.\n\n"
-        "Current proposed items:\n"
-        f"{listing}\n\n"
-        "Interpret the user's reply and call the right tool(s):\n"
-        "• remove_items — drop items. For a category like 'remove unhealthy snacks' or "
-        "'I'm on a diet, cut the junk', YOU decide which listed items qualify (chips, "
-        "candy, soda, cookies, donuts, ice cream, etc.) and remove all of them.\n"
-        "• update_item — adjust quantity, rate, brand, or unit for an item.\n"
-        "• add_item — add something they mention that's missing.\n"
-        "• show_full_list — they want to see every proposed item, not the summary.\n"
-        "• confirm_import — they're happy; save the list.\n"
-        "• cancel_import — they want to discard the whole thing.\n\n"
-        "They were shown a SUMMARY (counts + what looks low), not every item — but you "
-        "can see the full list above, so answer questions about any category directly. "
-        "Only call show_full_list when they ask for the entire list.\n\n"
-        "You may call several tools in one turn (e.g. remove three snacks at once). "
-        "After editing, briefly tell the user what you changed and what remains, and "
-        "ask if it looks good now. Match product names to the list above exactly. Be "
-        "warm and concise. Telegram HTML only (<b>, <i>); no markdown."
-    )
+
+
+def _items_context(items: list[dict]) -> dict:
+    """The current proposal as a transient trailing user block.
+
+    Recomputed every turn and never persisted, it sits AFTER the cache breakpoint
+    so editing the list leaves the cached system+tools+transcript prefix intact.
+    """
+    return {
+        "role": "user",
+        "content": (
+            "(Reference — current proposed pantry list, reflecting all edits so far:\n"
+            f"{_items_listing(items)}\n)"
+        ),
+    }
 
 
 async def advance_import_review(
@@ -575,16 +599,20 @@ async def advance_import_review(
     one of 'continue' | 'confirm' | 'cancel'. Edits are persisted to the staged
     proposal as they happen; the caller writes to the live pantry only on 'confirm'.
     """
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    client = llm.get_client()
 
     while True:
+        # Stable system+tools cache; the cache breakpoint rides the persisted
+        # transcript, and the volatile item list trails it (uncached) so an edit
+        # never busts the cached prefix. Pays off on the later review turns.
         resp = await client.messages.create(
             model=settings.model_fast,
             max_tokens=1500,
-            system=_review_system(items),
+            system=llm.cacheable_system(_REVIEW_SYSTEM),
             tools=_REVIEW_TOOLS,
-            messages=messages,
+            messages=llm.with_transcript_cache(messages) + [_items_context(items)],
         )
+        llm.record_usage(settings.model_fast, resp.usage, label="import_review")
         messages.append({"role": "assistant", "content": _serialize_blocks(resp.content)})
 
         if resp.stop_reason != "tool_use":

@@ -17,6 +17,8 @@ from pathlib import Path
 
 from playwright.async_api import BrowserContext, Page, async_playwright
 
+from grocery_buddy.automation import network as net
+from grocery_buddy.automation import resilience as R
 from grocery_buddy.config import settings
 
 logger = logging.getLogger(__name__)
@@ -268,13 +270,49 @@ async def search_grocery_price(
     selection among these candidates happens upstream in the activity layer.
     """
     page = await context.new_page()
+    # Opportunistic JSON capture — a hedge for the day Amazon moves search off SSR
+    # HTML onto a client-rendered JSON endpoint; meanwhile a no-cost health signal.
+    collector = net.JsonResponseCollector(("/s/query", "/api/", "search-alias", "data/aod"))
+    collector.attach(page)
+    if settings.amazon_block_heavy_resources:
+        await net.block_heavy_resources(page)
     try:
         url = AMAZON_GROCERY_SEARCH.format(query=product.replace(" ", "+"))
         await page.goto(url, timeout=20_000)
         await page.wait_for_load_state("domcontentloaded")
 
-        result_locator = page.locator('[data-component-type="s-search-result"]')
-        await result_locator.first.wait_for(timeout=15_000)
+        # Let the (server-rendered) result cards land before we resolve the anchor,
+        # so a not-yet-rendered page can't spuriously trip the repair path.
+        try:
+            await page.wait_for_selector(
+                '[data-component-type="s-search-result"], div.s-result-item[data-asin]',
+                timeout=15_000,
+            )
+        except Exception:
+            pass
+        await collector.drain()
+
+        # Resolve the result-card anchor through the resilient/self-healing path:
+        # stable data-attributes first, ARIA role as a churn-resistant fallback, and
+        # an LLM-over-accessibility-tree repair if every variant comes up empty.
+        result_locator = await R.resolve(
+            page, "search.results",
+            [
+                R.css('[data-component-type="s-search-result"]'),
+                R.css("div.s-result-item[data-asin]"),
+                R.css('[data-asin]:not([data-asin=""])'),
+                R.role("listitem"),
+            ],
+            page=page,
+            describe=(
+                "A single product result card in an Amazon grocery search results "
+                "list — it contains the product title link and the price."
+            ),
+            critical=True,
+        )
+        if result_locator is None:
+            logger.warning("Amazon search for %r found no result cards", product)
+            return []
 
         count = await result_locator.count()
         candidates: list[dict] = []
@@ -318,16 +356,19 @@ async def search_grocery_price(
                     continue
 
                 # Title — try multiple selectors; Amazon Fresh varies across result
-                # types. Fall back to the generic product name rather than crashing.
+                # types. ARIA heading role is the churn-resistant fallback. Fall back
+                # to the generic product name rather than crashing.
                 title = product
-                for title_sel in ("h2 a span", "h2 span", "[data-cy='title-recipe'] span",
-                                  ".a-size-medium", ".a-size-base-plus"):
-                    el = result.locator(title_sel).first
-                    if await el.count() and await el.is_visible():
-                        raw = await el.text_content(timeout=1_500)
-                        if raw and raw.strip():
-                            title = raw.strip()
-                            break
+                title_loc = await R.first_matching(result, [
+                    R.css("h2 a span"), R.css("h2 span"),
+                    R.css("[data-cy='title-recipe'] span"),
+                    R.css(".a-size-medium"), R.css(".a-size-base-plus"),
+                    R.role("heading"),
+                ], require_visible=True)
+                if title_loc is not None:
+                    raw = await title_loc.first.text_content(timeout=1_500)
+                    if raw and raw.strip():
+                        title = raw.strip()
 
                 candidates.append({
                     "product": title,
@@ -339,6 +380,14 @@ async def search_grocery_price(
                 logger.debug("Skipping result %d for %r: %s", i, product, exc)
                 continue
 
+        # Health: cards rendered (count>0) but nothing priced/extracted (candidates==0)
+        # is the signature of price/title selector drift — flag it as a degraded miss
+        # even though the page "worked", so a partial redesign doesn't stay silent.
+        R.observe(
+            "search.extract", matched=len(candidates), critical=False,
+            note=(f"{count} cards rendered but 0 priced — price/title selectors may have "
+                  "drifted") if (count and not candidates) else "",
+        )
         logger.info("Amazon search for %r → %d candidates", product, len(candidates))
         return candidates
 
@@ -363,38 +412,73 @@ _ATC_CONFIRM_SELECTORS = (
 
 
 async def add_to_cart_by_asin(asin: str, context: BrowserContext) -> bool:
-    """Add an item to the Amazon cart by ASIN. Returns True if successful."""
+    """Add an item to the Amazon cart by ASIN. Returns True if successful.
+
+    Confirmation comes primarily from Amazon's own cart-mutation NETWORK RESPONSE,
+    which fires regardless of which confirmation-overlay id the current layout uses —
+    far more stable than waiting on one of seven overlay CSS ids. The overlay and the
+    nav cart-count are kept as fallbacks. We deliberately do NOT resource-block or
+    JSON-mine this money-path page; the response observation is passive.
+    """
     page = await context.new_page()
     try:
         await page.goto(f"https://www.amazon.com/dp/{asin}", timeout=20_000)
         await page.wait_for_load_state("domcontentloaded")
 
-        add_btn = page.locator(
-            "#add-to-cart-button, input[name='submit.add-to-cart'], #submit\\.add-to-cart-announce"
-        ).first
-        await add_btn.click(timeout=10_000)
+        # Deterministic ids first, then an accessible-name fallback ("Add to Cart").
+        # We deliberately pass NO ``describe`` here, which disables LLM repair on this
+        # intent: self-healing is safe for reads, but letting an LLM free-pick *what to
+        # click* on a checkout page risks it choosing "Buy Now"/"Place order" and
+        # bypassing the cart-URL human handoff. A genuine 0-match records a critical
+        # miss and pages the user instead — the safe failure on the money path.
+        add_btn = await R.resolve(
+            page, "atc.button",
+            [
+                R.css("#add-to-cart-button"),
+                R.css("input[name='submit.add-to-cart']"),
+                R.css("#submit\\.add-to-cart-announce"),
+                R.role("button", "add to cart"),
+            ],
+            critical=True,
+            require_visible=True,
+        )
+        if add_btn is None:
+            logger.warning("Add-to-cart for %s: no add-to-cart button found", asin)
+            return False
 
-        # Do NOT wait for networkidle — Amazon pages keep loading ads/telemetry and
-        # never go idle, so that wait always times out even when the add succeeded.
-        # Instead wait for any confirmation signal, then fall back to the cart count.
-        try:
-            await page.locator(", ".join(_ATC_CONFIRM_SELECTORS)).first.wait_for(
-                state="visible", timeout=8_000
-            )
+        async def _click() -> None:
+            await add_btn.first.click(timeout=10_000)
+
+        # Click inside the network window so the cart-mutation response is our signal.
+        if await net.confirm_add_to_cart(page, _click):
+            R.observe("atc.confirm", matched=1, critical=True, note="network")
             return True
-        except Exception:
-            pass
 
-        # Fallback: the nav cart-count badge went above zero.
+        # Network inconclusive — fall back to the visual confirmation overlay, then
+        # the nav cart-count. (Do NOT wait for networkidle: ad/telemetry keeps these
+        # pages from ever going idle even when the add succeeded.)
         try:
-            count_txt = (
-                await page.locator("#nav-cart-count").first.text_content(timeout=2_000)
-            ) or "0"
-            if re.search(r"[1-9]", count_txt):
+            confirm = await R.first_matching(page, [R.css(s) for s in _ATC_CONFIRM_SELECTORS])
+            if confirm is not None:
+                await confirm.first.wait_for(state="visible", timeout=8_000)
+                R.observe("atc.confirm", matched=1, critical=True, note="overlay")
                 return True
         except Exception:
             pass
 
+        try:
+            count_loc = await R.first_matching(
+                page, [R.css("#nav-cart-count"), R.css("#nav-cart-count-container")]
+            )
+            count_txt = (await count_loc.first.text_content(timeout=2_000)) if count_loc else "0"
+            if count_txt and re.search(r"[1-9]", count_txt):
+                R.observe("atc.confirm", matched=1, critical=True, note="cart-count")
+                return True
+        except Exception:
+            pass
+
+        R.observe("atc.confirm", matched=0, critical=True,
+                  note="clicked but no network/overlay/count confirmation")
         logger.warning("Add-to-cart for %s: clicked but no confirmation detected", asin)
         return False
     except Exception as exc:
@@ -411,8 +495,23 @@ async def get_cart_total(context: BrowserContext) -> float | None:
         await page.goto("https://www.amazon.com/gp/cart/view.html", timeout=15_000)
         await page.wait_for_load_state("domcontentloaded")
 
-        subtotal_el = page.locator("#sc-subtotal-amount-activecart, #sc-subtotal-label-activecart").first
-        text = (await subtotal_el.text_content(timeout=5_000) or "").strip()
+        subtotal = await R.resolve(
+            page, "cart.subtotal",
+            [
+                R.css("#sc-subtotal-amount-activecart"),
+                R.css("#sc-subtotal-label-activecart"),
+                R.css("#sc-subtotal-amount-buybox"),
+                R.css("[data-name='Subtotal'] .a-price .a-offscreen"),
+            ],
+            page=page,
+            describe=("The cart subtotal amount on the Amazon shopping-cart page — a "
+                      "dollar figure labeled 'Subtotal'."),
+            critical=False,
+        )
+        if subtotal is None:
+            logger.warning("get_cart_total: subtotal element not found")
+            return None
+        text = (await subtotal.first.text_content(timeout=5_000) or "").strip()
         m = re.search(r"\$([\d,]+\.?\d*)", text)
         return float(m.group(1).replace(",", "")) if m else None
     except Exception as exc:
@@ -478,23 +577,34 @@ async def clear_cart(context: BrowserContext) -> bool:
         await page.wait_for_load_state("domcontentloaded")
 
         remaining = await _count_cart_items(page)
+        if remaining == 0:
+            return True  # already empty — nothing to clear, no health event
+
         for _ in range(_CLEAR_CART_MAX_ITERATIONS):
             if remaining == 0:
+                R.observe("cart.clear", matched=1, critical=True, note="emptied")
                 return True
 
             # Scope the Delete control to the first active item so we can't pick up
-            # a Delete that belongs to "Saved for later" or some other section.
+            # a Delete that belongs to "Saved for later" or some other section. We
+            # resolve deterministically and pass NO describe — like add-to-cart we
+            # never let an LLM free-pick what to click on the money path.
             item = page.locator(_CART_ITEM_CSS).first
-            delete_btn = item.locator(", ".join(_CART_DELETE_SELECTORS)).first
-            if not await delete_btn.count():
+            delete_btn = await R.first_matching(
+                item, [R.css(s) for s in _CART_DELETE_SELECTORS]
+            )
+            if delete_btn is None:
+                R.observe("cart.clear", matched=0, critical=True,
+                          note=f"{remaining} item(s) but no Delete control")
                 logger.warning(
                     "clear_cart: %d item(s) but no Delete control found — stopping",
                     remaining,
                 )
                 return False
             try:
-                await delete_btn.click(timeout=10_000)
+                await delete_btn.first.click(timeout=10_000)
             except Exception as exc:
+                R.observe("cart.clear", matched=0, critical=True, note="delete click failed")
                 logger.warning("clear_cart: delete click failed (%s)", exc)
                 return False
 
@@ -513,6 +623,8 @@ async def clear_cart(context: BrowserContext) -> bool:
 
             new_count = await _count_cart_items(page)
             if new_count >= remaining:
+                R.observe("cart.clear", matched=0, critical=True,
+                          note=f"no progress ({new_count} remain)")
                 logger.warning(
                     "clear_cart: no progress (%d item(s) remain) — stopping", new_count
                 )
@@ -520,7 +632,10 @@ async def clear_cart(context: BrowserContext) -> bool:
             remaining = new_count
 
         # Exhausted the iteration cap — report the final state honestly.
-        return await _count_cart_items(page) == 0
+        empty = await _count_cart_items(page) == 0
+        R.observe("cart.clear", matched=1 if empty else 0, critical=True,
+                  note="hit iteration cap; " + ("empty" if empty else "items remain"))
+        return empty
     except Exception as exc:
         logger.warning("clear_cart failed: %s", exc)
         return False
@@ -884,10 +999,13 @@ async def _scrape_orders_on_page(page: Page) -> list[dict]:
             if items:
                 orders.append({"order_date": order_date, "items": items})
         if orders:
+            R.observe("orders.page", matched=len(orders), critical=False)
             return orders
 
     # Search-results layout (one item per row) — the /import default.
-    return await _scrape_item_rows(page)
+    rows = await _scrape_item_rows(page)
+    R.observe("orders.page", matched=len(rows), critical=False)
+    return rows
 
 
 async def _get_next_page_url(page: Page) -> str | None:
@@ -906,6 +1024,17 @@ async def _get_next_page_url(page: Page) -> str | None:
                     return href if href.startswith("http") else "https://www.amazon.com" + href
         except Exception:
             continue
+
+    # ARIA fallback: a link whose accessible name is "Next" — survives the
+    # a-pagination class churn.
+    try:
+        el = page.get_by_role("link", name=re.compile(r"\bnext\b", re.I)).first
+        if await el.count() and await el.is_visible():
+            href = (await el.get_attribute("href") or "").strip()
+            if href:
+                return href if href.startswith("http") else "https://www.amazon.com" + href
+    except Exception:
+        pass
     return None
 
 
@@ -941,6 +1070,14 @@ async def scrape_order_history(
     Best-effort — returns whatever it managed to read; never raises.
     """
     page = await context.new_page()
+    # Read-only path: kill the images/ads/telemetry that otherwise keep these pages
+    # loading forever, so each of (potentially) 20 pages settles faster.
+    if settings.amazon_block_heavy_resources:
+        await net.block_heavy_resources(page)
+    # Opportunistic JSON capture — a hedge for the day Amazon moves order history off
+    # SSR HTML; also a health signal for whether any JSON endpoint fired.
+    collector = net.JsonResponseCollector(("/your-orders/", "/order-history", "/api/", "css/order"))
+    collector.attach(page)
     orders: list[dict] = []
     seen_keys: set[str] = set()  # dedupe items across pages; also detects looping
 
@@ -961,6 +1098,7 @@ async def scrape_order_history(
             except Exception:
                 pass  # genuinely empty results, or a different layout — scrape decides
             await page.wait_for_timeout(800)
+            await collector.drain()
 
             if await _looks_throttled(page):
                 logger.warning(
@@ -970,6 +1108,16 @@ async def scrape_order_history(
                 break
 
             page_orders = await _scrape_orders_on_page(page)
+            # First-page emptiness is the make-or-break signal (login expired, or the
+            # order-row anchor/XPath stopped matching after a redesign) — record it as
+            # a critical miss so the activity layer pages the user instead of the old
+            # silent empty import.
+            if page_num == 0:
+                R.observe(
+                    "orders.firstpage", matched=len(page_orders), critical=True,
+                    note=("first listing page had no orders — login expired or the order "
+                          "selectors drifted") if not page_orders else "",
+                )
             if not page_orders:
                 # First page empty usually means we never reached the order list
                 # (login expired, or the search matched nothing). Later empty pages

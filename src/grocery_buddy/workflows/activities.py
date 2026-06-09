@@ -12,11 +12,13 @@ from temporalio import activity
 
 from grocery_buddy.config import settings
 from grocery_buddy.db import get_pool
+from grocery_buddy.llm import run_scope
 from grocery_buddy.models import AMAZON_LOGIN_REQUIRED
 from grocery_buddy.notifications import (
     send_arrival_notification,
     send_briefing,
     send_checkout_link,
+    send_selector_health_alert,
     send_telegram_message,
 )
 from grocery_buddy.predictor import (
@@ -32,6 +34,31 @@ from grocery_buddy.tools.consumption import (
 from grocery_buddy.tools.inventory import get_inventory
 
 logger = logging.getLogger(__name__)
+
+
+def _wf_id() -> str | None:
+    """The current Temporal run id (for attributing LLM cost to a run), or None."""
+    try:
+        return activity.info().workflow_id
+    except Exception:
+        return None
+
+
+async def _flush_selector_health(report, context: str) -> None:
+    """Score Langfuse and (if any selector broke or self-healed) page the user.
+
+    ``summarize_health`` emits the Langfuse score as a side effect regardless, so we
+    always call it; only the Telegram alert is gated by ``SELECTOR_HEALTH_ALERTS``.
+    Best-effort — selector observability must never fail a real run.
+    """
+    try:
+        from grocery_buddy.automation.resilience import summarize_health
+
+        summary = summarize_health(report)
+        if summary and settings.selector_health_alerts:
+            await send_selector_health_alert(summary)
+    except Exception as exc:
+        logger.warning("Selector-health flush failed (%s)", exc)
 
 
 # ── User-facing notices (so a run never ends in silence) ──────────────────────
@@ -245,6 +272,43 @@ async def select_run_candidates_activity(user_data: dict) -> dict:
         incoming_by_product=user_data.get("incoming") or {},
     )
 
+    # Snapshot what the predictor decided for EVERY item (flagged-low or not) so the
+    # eval can later compare it against what was actually bought → real precision/
+    # recall. Best-effort: a telemetry failure must never block a grocery run.
+    try:
+        from grocery_buddy.predictor import LOW
+        from grocery_buddy.tools.predictions import record_prediction_snapshot
+
+        def _days(d: float | None) -> float | None:
+            if d is None or math.isinf(d) or math.isnan(d):
+                return None
+            return d
+
+        predicted = [
+            {
+                "product": lv.product,
+                "flagged_low": lv.bucket == LOW,
+                "bucket": lv.bucket,
+                "days_remaining": _days(lv.days_remaining),
+                "effective_rate": lv.effective_rate,
+                "qty": lv.qty,
+                "incoming": lv.incoming,
+            }
+            for lv in levels
+        ]
+        pool = await get_pool()
+        await record_prediction_snapshot(
+            pool,
+            user_id=user_data["user_id"],
+            workflow_id=_wf_id(),
+            run_trigger=user_data.get("trigger"),
+            predicted=predicted,
+            lead_time_days=float(user_data.get("lead_time_days", 2.0)),
+            buffer_days=float(user_data.get("buffer_days", 1.0)),
+        )
+    except Exception as exc:
+        logger.warning("Prediction snapshot skipped: %s", exc)
+
     max_fillers = int(settings.free_shipping_max_fillers)
     must_buy, fillers = split_run_candidates(levels, max_fillers)
 
@@ -283,6 +347,7 @@ async def lookup_amazon_prices(payload: dict) -> list[dict]:
     that product (``brand_prefs[product] = {preferred_brand, brand_flexibility}``).
     """
     from grocery_buddy.automation.amazon import get_browser_context, search_grocery_price
+    from grocery_buddy.automation.resilience import health_run
     from grocery_buddy.products import normalize_product
 
     items = payload["items"]
@@ -305,45 +370,49 @@ async def lookup_amazon_prices(payload: dict) -> list[dict]:
 
     p, context = await get_browser_context()
     priced: list[dict] = []
-    try:
-        for item in items:
-            candidates = await search_grocery_price(item["product"], context)
-            if not candidates:
-                logger.warning("No Amazon results for %r — skipping", item["product"])
-                continue
+    with health_run("pricing") as health:
+        try:
+            for item in items:
+                candidates = await search_grocery_price(item["product"], context)
+                if not candidates:
+                    logger.warning("No Amazon results for %r — skipping", item["product"])
+                    continue
 
-            pref = brand_prefs.get(normalize_product(item["product"]), {})
-            chosen, reason = await _select_candidate_by_brand(
-                product=item["product"],
-                candidates=candidates,
-                preferred_brand=pref.get("preferred_brand"),
-                brand_flexibility=pref.get("brand_flexibility", "any"),
-            )
-            if chosen is None:
-                logger.info("Brand-strict match unavailable for %r — skipping", item["product"])
-                continue
+                pref = brand_prefs.get(normalize_product(item["product"]), {})
+                # Attribute the brand-pick LLM cost to this run for the cost alert.
+                with run_scope(_wf_id(), payload.get("user_id")):
+                    chosen, reason = await _select_candidate_by_brand(
+                        product=item["product"],
+                        candidates=candidates,
+                        preferred_brand=pref.get("preferred_brand"),
+                        brand_flexibility=pref.get("brand_flexibility", "any"),
+                    )
+                if chosen is None:
+                    logger.info("Brand-strict match unavailable for %r — skipping", item["product"])
+                    continue
 
-            logger.info("Selected %r for %r (%s)", chosen["product"], item["product"], reason)
-            priced.append({
-                "product": item["product"],
-                "qty": item["par_level"],  # buy up to par
-                "unit": item["unit"],
-                "price_usd": chosen["price_usd"],
-                "price_source": "amazon_scraped",
-                "asin": chosen.get("asin"),
-                "kroger_sku": None,
-                # The actual Amazon listing we'd buy — this is what the user sees in
-                # the briefing (the brand/variant matters, not just "milk").
-                "notes": chosen["product"],
-                # Carried through for the free-shipping assembler: which lines are
-                # must-buys vs. fillers, and how soon each runs out.
-                "tier": item.get("tier", "must_buy"),
-                "days_remaining": item.get("days_remaining"),
-            })
-    finally:
-        await context.close()
-        await p.stop()
+                logger.info("Selected %r for %r (%s)", chosen["product"], item["product"], reason)
+                priced.append({
+                    "product": item["product"],
+                    "qty": item["par_level"],  # buy up to par
+                    "unit": item["unit"],
+                    "price_usd": chosen["price_usd"],
+                    "price_source": "amazon_scraped",
+                    "asin": chosen.get("asin"),
+                    "kroger_sku": None,
+                    # The actual Amazon listing we'd buy — this is what the user sees in
+                    # the briefing (the brand/variant matters, not just "milk").
+                    "notes": chosen["product"],
+                    # Carried through for the free-shipping assembler: which lines are
+                    # must-buys vs. fillers, and how soon each runs out.
+                    "tier": item.get("tier", "must_buy"),
+                    "days_remaining": item.get("days_remaining"),
+                })
+        finally:
+            await context.close()
+            await p.stop()
 
+    await _flush_selector_health(health, "Amazon pricing")
     return priced
 
 
@@ -365,7 +434,7 @@ async def _select_candidate_by_brand(
     Short-circuits the LLM when there's nothing to reason about (no preference,
     or a single candidate) to keep cost near zero on the common path.
     """
-    import anthropic
+    from grocery_buddy import llm
 
     # No preference or nothing to choose between → cheapest, no LLM call.
     if not preferred_brand or brand_flexibility == "any" or len(candidates) == 1:
@@ -386,7 +455,7 @@ async def _select_candidate_by_brand(
         ),
     }.get(brand_flexibility, "Pick the cheapest reasonable match.")
 
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    client = llm.get_client()
     try:
         resp = await client.messages.create(
             model=settings.model_fast,
@@ -407,6 +476,7 @@ async def _select_candidate_by_brand(
                 ),
             }],
         )
+        llm.record_usage(settings.model_fast, resp.usage, label="brand_select")
         text = "".join(b.text for b in resp.content if hasattr(b, "text")).strip()
         # Tolerate fenced/extra text around the JSON.
         m = re.search(r"\{.*\}", text, re.DOTALL)
@@ -556,13 +626,16 @@ async def send_approval_notification(payload: dict) -> None:
         uuid.UUID(cart_id),
     )
     items = [dict(r) for r in rows]
-    await send_briefing(
-        cart_id=cart_id,
-        total_usd=payload["total_usd"],
-        workflow_id=payload["workflow_id"],
-        items=items,
-        reason=payload.get("reason"),
-    )
+    # Attribute the briefing-composition LLM cost (compose_briefing, called inside
+    # send_briefing) to this run for the cost alert.
+    with run_scope(_wf_id()):
+        await send_briefing(
+            cart_id=cart_id,
+            total_usd=payload["total_usd"],
+            workflow_id=payload["workflow_id"],
+            items=items,
+            reason=payload.get("reason"),
+        )
 
 
 # ── T11/T12: Cart status + purchase ──────────────────────────────────────────
@@ -595,6 +668,7 @@ async def prepare_checkout_activity(payload: dict) -> dict:
         clear_cart,
         get_browser_context,
     )
+    from grocery_buddy.automation.resilience import health_run
 
     cart_id = payload["cart_id"]
     idempotency_key = payload["idempotency_key"]
@@ -628,83 +702,87 @@ async def prepare_checkout_activity(payload: dict) -> dict:
     )
 
     p, context = await get_browser_context()
-    try:
-        # Start from an empty Amazon cart. The cart is real, persistent,
-        # account-scoped state shared across runs (and with the user's own
-        # shopping), so without this a previously staged-but-unbought cart — or
-        # leftovers from a crashed earlier attempt under this NO_RETRY activity —
-        # would stack on top of this run's items and let the user over-order.
-        # Clearing first is also what makes the re-stage path safe for any prior
-        # purchase state that isn't 'checkout_ready' (a crashed 'pending', or a
-        # previous 'failed'/'completed'): we reconcile by clear-then-restage
-        # rather than blindly re-adding. We refuse to stage onto a cart we can't
-        # verify empty rather than risk that accumulation.
-        if not await clear_cart(context):
-            raise RuntimeError(
-                "Couldn't empty the existing Amazon cart before staging — "
-                "refusing to stage to avoid mixing in stale items."
+    with health_run("checkout") as health:
+        try:
+            # Start from an empty Amazon cart. The cart is real, persistent,
+            # account-scoped state shared across runs (and with the user's own
+            # shopping), so without this a previously staged-but-unbought cart — or
+            # leftovers from a crashed earlier attempt under this NO_RETRY activity —
+            # would stack on top of this run's items and let the user over-order.
+            # Clearing first is also what makes the re-stage path safe for any prior
+            # purchase state that isn't 'checkout_ready' (a crashed 'pending', or a
+            # previous 'failed'/'completed'): we reconcile by clear-then-restage
+            # rather than blindly re-adding. We refuse to stage onto a cart we can't
+            # verify empty rather than risk that accumulation.
+            if not await clear_cart(context):
+                raise RuntimeError(
+                    "Couldn't empty the existing Amazon cart before staging — "
+                    "refusing to stage to avoid mixing in stale items."
+                )
+
+            # Add each item to the Amazon cart. A single item failing shouldn't sink
+            # the whole order — stage whatever we can and report it.
+            added = 0
+            for item in items:
+                asin = item["asin"]
+                if not asin:
+                    logger.warning("No ASIN for %s — cannot add to cart", item["product"])
+                    continue
+                if await add_to_cart_by_asin(asin, context):
+                    added += 1
+                else:
+                    logger.warning("Couldn't add %s (ASIN %s) to cart", item["product"], asin)
+
+            if added == 0:
+                raise RuntimeError("Couldn't add any items to the Amazon cart")
+
+            # Hand back the account-scoped cart URL rather than driving into the
+            # session-bound /gp/buy/spc/ checkout flow: that SPC URL belongs to this
+            # Playwright session and makes the user re-authenticate (the double-auth)
+            # when opened on their phone. The cart URL resolves against their own
+            # signed-in Amazon — web or app — where these items now sit, so they land
+            # one tap from checkout without a second login.
+            checkout_url = AMAZON_CART_URL
+
+            total_usd = float(await pool.fetchval(
+                "SELECT total_usd FROM carts WHERE id = $1", uuid.UUID(cart_id)
+            ) or 0)
+
+            await pool.execute(
+                """
+                UPDATE purchases
+                SET status = 'checkout_ready', retailer_order_ref = $2, total_usd = $3
+                WHERE id = $1
+                """,
+                uuid.UUID(purchase_id), checkout_url, round(total_usd, 2),
+            )
+            await pool.execute(
+                "UPDATE carts SET status = 'checkout_ready', updated_at = NOW() WHERE id = $1",
+                uuid.UUID(cart_id),
             )
 
-        # Add each item to the Amazon cart. A single item failing shouldn't sink
-        # the whole order — stage whatever we can and report it.
-        added = 0
-        for item in items:
-            asin = item["asin"]
-            if not asin:
-                logger.warning("No ASIN for %s — cannot add to cart", item["product"])
-                continue
-            if await add_to_cart_by_asin(asin, context):
-                added += 1
-            else:
-                logger.warning("Couldn't add %s (ASIN %s) to cart", item["product"], asin)
+            await send_checkout_link(cart_id, total_usd, checkout_url)
+            logger.info("Checkout staged for cart %s (%d items) → %s", cart_id, added, checkout_url)
+            return {"status": "checkout_ready", "idempotency_key": idempotency_key, "total_usd": total_usd}
 
-        if added == 0:
-            raise RuntimeError("Couldn't add any items to the Amazon cart")
-
-        # Hand back the account-scoped cart URL rather than driving into the
-        # session-bound /gp/buy/spc/ checkout flow: that SPC URL belongs to this
-        # Playwright session and makes the user re-authenticate (the double-auth)
-        # when opened on their phone. The cart URL resolves against their own
-        # signed-in Amazon — web or app — where these items now sit, so they land
-        # one tap from checkout without a second login.
-        checkout_url = AMAZON_CART_URL
-
-        total_usd = float(await pool.fetchval(
-            "SELECT total_usd FROM carts WHERE id = $1", uuid.UUID(cart_id)
-        ) or 0)
-
-        await pool.execute(
-            """
-            UPDATE purchases
-            SET status = 'checkout_ready', retailer_order_ref = $2, total_usd = $3
-            WHERE id = $1
-            """,
-            uuid.UUID(purchase_id), checkout_url, round(total_usd, 2),
-        )
-        await pool.execute(
-            "UPDATE carts SET status = 'checkout_ready', updated_at = NOW() WHERE id = $1",
-            uuid.UUID(cart_id),
-        )
-
-        await send_checkout_link(cart_id, total_usd, checkout_url)
-        logger.info("Checkout staged for cart %s (%d items) → %s", cart_id, added, checkout_url)
-        return {"status": "checkout_ready", "idempotency_key": idempotency_key, "total_usd": total_usd}
-
-    except Exception as exc:
-        await pool.execute(
-            "UPDATE purchases SET status = 'failed', error = $2 WHERE id = $1",
-            uuid.UUID(purchase_id), str(exc),
-        )
-        await pool.execute(
-            "UPDATE carts SET status = 'failed', updated_at = NOW() WHERE id = $1",
-            uuid.UUID(cart_id),
-        )
-        # Re-raise — the workflow's top-level handler sends the single user-facing
-        # "something went wrong" message (avoids double-notifying + leaking detail).
-        raise
-    finally:
-        await context.close()
-        await p.stop()
+        except Exception as exc:
+            await pool.execute(
+                "UPDATE purchases SET status = 'failed', error = $2 WHERE id = $1",
+                uuid.UUID(purchase_id), str(exc),
+            )
+            await pool.execute(
+                "UPDATE carts SET status = 'failed', updated_at = NOW() WHERE id = $1",
+                uuid.UUID(cart_id),
+            )
+            # Re-raise — the workflow's top-level handler sends the single user-facing
+            # "something went wrong" message (avoids double-notifying + leaking detail).
+            raise
+        finally:
+            await context.close()
+            await p.stop()
+            # Flush here (not after the with-block) so a selector-breakage that made
+            # added==0 still pages the user — the failure path re-raises above.
+            await _flush_selector_health(health, "Amazon checkout")
 
 
 @activity.defn
@@ -721,13 +799,18 @@ async def send_checkout_link_activity(payload: dict) -> None:
 
 @activity.defn
 async def run_evals_activity(payload: dict) -> dict:
-    """Compute prediction accuracy and emit scores to Langfuse."""
-    from grocery_buddy.evals import run_evals, check_cost_alert
+    """Compute prediction accuracy, total the run's REAL LLM cost, and alert if high."""
+    from grocery_buddy.evals import check_cost_alert, run_evals, sum_run_cost
     user_id = payload["user_id"]
-    run_cost_usd = payload.get("run_cost_usd", 0.0)
 
+    # Real per-run cost = SUM(cost_usd) of this run's llm_usage rows (was hardcoded 0.0,
+    # so the alert could never fire). run_evals_activity runs in the same workflow as
+    # the brand-pick + briefing calls, so its workflow_id matches their ledger rows.
+    run_cost_usd = await sum_run_cost(_wf_id())
     await check_cost_alert(run_cost_usd, user_id)
-    return await run_evals(user_id)
+    results = await run_evals(user_id)
+    results["run_cost_usd"] = round(run_cost_usd, 6)
+    return results
 
 
 # ── Onboarding import: re-login → scrape → synthesize → stage proposal ────────
@@ -883,6 +966,7 @@ async def scrape_amazon_orders_activity(user_id: str) -> list[dict]:
     import shutil
 
     from grocery_buddy.automation.amazon import get_scraper_context, scrape_order_history
+    from grocery_buddy.automation.resilience import health_run
 
     search_name = (settings.amazon_account_first_name or "").strip() or None
     if not search_name:
@@ -892,17 +976,20 @@ async def scrape_amazon_orders_activity(user_id: str) -> list[dict]:
         )
 
     pw, context, temp_dir = await get_scraper_context()
-    try:
-        return await scrape_order_history(
-            context,
-            search_name=search_name,
-            max_pages=settings.amazon_import_max_pages,
-            max_orders=settings.amazon_import_max_orders,
-        )
-    finally:
-        await context.close()
-        await pw.stop()
-        shutil.rmtree(str(temp_dir), ignore_errors=True)
+    with health_run("import") as health:
+        try:
+            orders = await scrape_order_history(
+                context,
+                search_name=search_name,
+                max_pages=settings.amazon_import_max_pages,
+                max_orders=settings.amazon_import_max_orders,
+            )
+        finally:
+            await context.close()
+            await pw.stop()
+            shutil.rmtree(str(temp_dir), ignore_errors=True)
+    await _flush_selector_health(health, "Amazon order import")
+    return orders
 
 
 @activity.defn
@@ -910,7 +997,9 @@ async def synthesize_pantry_from_orders_activity(orders: list[dict]) -> list[dic
     """Sonnet synthesis: raw orders → proposed grocery/household pantry items."""
     from grocery_buddy.agents.order_history import synthesize_grocery_history
 
-    return await synthesize_grocery_history(orders)
+    # Attribute the (potentially large) Sonnet synthesis cost to the import run.
+    with run_scope(_wf_id()):
+        return await synthesize_grocery_history(orders)
 
 
 @activity.defn

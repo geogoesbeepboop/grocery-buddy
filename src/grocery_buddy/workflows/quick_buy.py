@@ -13,8 +13,7 @@ unchanged.
 SANDBOX RULES: see grocery_run.py — no `from __future__`, no module-level
 project imports outside the passthrough block, reference activities by string.
 """
-import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -39,7 +38,7 @@ def _parse_eta(eta_iso: str | None) -> datetime | None:
         dt = datetime.fromisoformat(eta_iso)
     except (TypeError, ValueError):
         return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 _STANDARD_RETRY = RetryPolicy(
     initial_interval=timedelta(seconds=5),
@@ -206,7 +205,7 @@ class QuickBuyWorkflow:
                 lambda: self._decision is not None,
                 timeout=_APPROVAL_WAIT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._decision = "expired"
 
         final_status = self._decision or "expired"
@@ -251,7 +250,7 @@ class QuickBuyWorkflow:
                 lambda: self._purchase_decision is not None,
                 timeout=_CONFIRM_WAIT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             workflow.logger.info("No purchase confirmation for quick-buy cart %s", cart_id)
             return GroceryRunResult(status="checkout_ready", cart_id=cart_id)
 

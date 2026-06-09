@@ -868,8 +868,8 @@ async def _finalize_import(
     """Persist a confirmed proposal into inventory + habits, then run first grocery run."""
     from grocery_buddy.db import get_pool
     from grocery_buddy.notifications import send_telegram_message
-    from grocery_buddy.tools.conversation import clear_conversation
     from grocery_buddy.tools.consumption import upsert_consumption_profile
+    from grocery_buddy.tools.conversation import clear_conversation
     from grocery_buddy.tools.imports import set_proposal_status
     from grocery_buddy.tools.inventory import upsert_inventory_item
 

@@ -19,7 +19,7 @@ back on the rate it's derived from.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import UUID
 
 import asyncpg
@@ -48,8 +48,8 @@ def _as_utc(ts) -> datetime:
     if isinstance(ts, str):
         ts = datetime.fromisoformat(ts)
     if ts.tzinfo is None:
-        return ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc)
+        return ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC)
 
 
 async def apply_estimated_depletion(pool: asyncpg.Pool, user_id: str) -> list[dict]:
@@ -82,7 +82,7 @@ async def apply_estimated_depletion(pool: asyncpg.Pool, user_id: str) -> list[di
             )
         )
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     applied: list[dict] = []
 
     for item in inventory:

@@ -8,7 +8,9 @@ change behavior, update this file.
 > way), [DATABASE.md](DATABASE.md) (schema detail), [OPERATIONS.md](OPERATIONS.md),
 > [SETUP.md](SETUP.md), [HOSTING.md](HOSTING.md),
 > [FEATURES_AND_ROADMAP.md](FEATURES_AND_ROADMAP.md) (what's next),
-> [PROCUREMENT_CONVERGENCE.md](PROCUREMENT_CONVERGENCE.md) (the merge decision).
+> [PROCUREMENT_CONVERGENCE.md](PROCUREMENT_CONVERGENCE.md) (the merge decision),
+> [EVALS.md](EVALS.md) (how we measure prediction accuracy, LLM-output quality, and
+> per-run cost — and how those gate money-live).
 
 ---
 

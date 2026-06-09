@@ -1,0 +1,2 @@
+{"message": "I've got a dozen eggs and go through them in about 2 weeks. We drink a gallon of milk a week, prefer Horizon. And I keep a 6-pack of paper towels around.", "expect_products_contain": ["egg", "milk", "paper towel"]}
+{"message": "Stock: 2 bags of coffee (a bag lasts ~10 days), 5 lbs rice, and a bottle of olive oil I refill monthly.", "expect_products_contain": ["coffee", "rice", "olive oil"]}
