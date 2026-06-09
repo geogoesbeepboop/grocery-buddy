@@ -1,4 +1,4 @@
-.PHONY: help dev install test lint temporal worker webhook run ask onboard evals mcp docker-build
+.PHONY: help dev restart down install test lint temporal worker webhook run ask onboard evals mcp docker-build
 
 USER_ID ?= $(shell grep GROCERY_BUDDY_USER_ID .env.local 2>/dev/null | cut -d= -f2)
 
@@ -68,14 +68,11 @@ mcp: ## Start MCP server (for Claude Code local dev)
 docker-build: ## Build the Docker image
 	docker build -t grocery-buddy .
 
-dev: ## Print dev startup checklist
-	@echo ""
-	@echo "── Dev startup checklist ─────────────────────────────"
-	@echo "  1. make temporal          (start Temporal)"
-	@echo "  2. make worker            (in a new terminal)"
-	@echo "  3. make webhook           (in a new terminal)"
-	@echo "  4. ngrok http 8080        (in a new terminal)"
-	@echo "  5. Update WEBHOOK_BASE_URL in .env with ngrok URL"
-	@echo "  6. make run USER_ID=<uuid>"
-	@echo "  7. Temporal UI → http://localhost:8088"
-	@echo ""
+dev: ## Launch the full local stack in Terminal windows (Temporal + worker + webhook)
+	./scripts/dev.sh up
+
+restart: ## Bounce the app (worker + webhook) after a code change — the test loop
+	./scripts/dev.sh restart
+
+down: ## Stop everything (worker, webhook, ngrok, Temporal)
+	./scripts/dev.sh down
